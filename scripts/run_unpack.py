@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Run unlicense against every prepared sample whose PE bitness matches this
+interpreter, collect per-sample outcomes, and write a markdown + JSON report.
+
+Statuses:
+  OK          unpacked_<name> produced
+  FAIL        unlicense ran but no dump / nonzero exit
+  ERROR       crashed (traceback) — tail kept in report
+  SKIP_ARCH   PE bitness != interpreter bitness (other matrix job handles it)
+  SKIP_*      not downloadable / no PE
+
+Exit code: 1 if any FAIL/ERROR, else 0.
+"""
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+RESULTS = ROOT / "results"
+RUNS = ROOT / "runs"
+
+PER_SAMPLE_TIMEOUT = 300  # hard kill guard (unlicense has its own --timeout)
+UNLICENSE_OEP_TIMEOUT = 120  # seconds to wait for OEP inside unlicense
+
+
+def interpreter_bitness() -> str:
+    return "x64" if (platform.machine() == "AMD64" and sys.maxsize > 2**32) or \
+        platform.machine() in ("AMD64", "x86_64") else "x86"
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                   capture_output=True)
+
+
+def run_one(pe_rel: str) -> dict:
+    pe = ROOT / pe_rel
+    label = Path(pe_rel).stem
+    workdir = RUNS / label
+    if workdir.exists():
+        shutil.rmtree(workdir, ignore_errors=True)
+    workdir.mkdir(parents=True)
+
+    cmd = [sys.executable, "-m", "unlicense", str(pe),
+           "--timeout", str(UNLICENSE_OEP_TIMEOUT)]
+    start = time.time()
+    log_lines = []
+    status = "FAIL"
+    try:
+        proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                errors="replace", bufsize=1)
+        try:
+            out, _ = proc.communicate(timeout=PER_SAMPLE_TIMEOUT)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            out, _ = proc.communicate(timeout=30)
+            rc = -999
+            status = "FAIL"
+        log_lines = (out or "").splitlines()
+        dumps = list(workdir.glob("unpacked_*"))
+        dumps = [d for d in dumps if d.is_file() and d.stat().st_size > 1024]
+        if dumps:
+            status = "OK"
+        elif rc == 0 and not dumps:
+            # unlicense exits 0 only after a successful dump normally; be safe
+            status = "FAIL"
+        elif "Traceback" in (out or ""):
+            status = "ERROR"
+        elif rc == -999:
+            status = "FAIL"
+        else:
+            status = "FAIL"
+        result = {"status": status, "rc": rc,
+                  "seconds": round(time.time() - start, 1),
+                  "dumps": [d.name for d in dumps]}
+        # collect artifacts
+        out_dir = RESULTS / "unpacked"
+        out_dir.mkdir(exist_ok=True)
+        for d in dumps:
+            shutil.copy(d, out_dir / f"{label}_{d.name}")
+        (RESULTS / "logs").mkdir(exist_ok=True)
+        (RESULTS / "logs" / f"{label}.log").write_text("\n".join(log_lines[-400:]))
+        result["tail"] = log_lines[-6:]
+    except Exception as exc:  # noqa: BLE001
+        result = {"status": "ERROR", "rc": -1, "seconds": 0,
+                  "dumps": [], "tail": [f"runner exception: {exc}"]}
+    return result
+
+
+def main() -> int:
+    sys.path.insert(0, str(ROOT))
+    manifest = json.loads((RESULTS / "manifest.json").read_text())
+    bitness = interpreter_bitness()
+    print(f"interpreter bitness: {bitness}")
+
+    rows = []
+    has_bad = False
+    for entry in manifest:
+        label = entry["label"]
+        if not entry["downloaded"] or not entry["pes"]:
+            rows.append({"label": label, "pe": "-", "arch": "-",
+                         "version": "-", "status": entry["status"],
+                         "rc": "-", "sec": 0, "tail": []})
+            continue
+        for pe_info in entry["pes"]:
+            if pe_info["arch"] != bitness:
+                rows.append({"label": label, "pe": Path(pe_info["path"]).name,
+                             "arch": pe_info["arch"],
+                             "version": pe_info["version"],
+                             "status": "SKIP_ARCH", "rc": "-", "sec": 0,
+                             "tail": []})
+                continue
+            print(f"[{label}] running {pe_info['path']} (v{pe_info['version']}) ...",
+                  flush=True)
+            res = run_one(pe_info["path"])
+            print(f"[{label}] -> {res['status']} rc={res['rc']} "
+                  f"{res['seconds']}s dumps={res['dumps']}", flush=True)
+            if res["status"] in ("FAIL", "ERROR"):
+                has_bad = True
+            rows.append({"label": label, "pe": Path(pe_info["path"]).name,
+                         "arch": pe_info["arch"], "version": pe_info["version"],
+                         **res})
+
+    report = {"bitness": bitness, "rows": rows,
+              "ok": sum(1 for r in rows if r["status"] == "OK"),
+              "fail": sum(1 for r in rows if r["status"] in ("FAIL", "ERROR"))}
+    (RESULTS / f"report_{bitness}.json").write_text(json.dumps(report, indent=2))
+
+    # markdown summary
+    md = [f"## Unpack report (python {bitness})", "",
+          "| sample | PE | ver | status | rc | sec | tail |",
+          "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        tail = " / ".join(t.strip() for t in r.get("tail", [])[-2:])[:160]
+        tail = tail.replace("|", "\\|")
+        md.append(f"| {r['label']} | {r['pe']} | {r['version']} | "
+                  f"{r['status']} | {r['rc']} | {r['sec']} | `{tail}` |")
+    md.append("")
+    md.append(f"**OK: {report['ok']}  FAIL/ERROR: {report['fail']}**")
+    summary = "\n".join(md) + "\n"
+    print(summary)
+    gh_sum = os.environ.get("GITHUB_STEP_SUMMARY")
+    if gh_sum:
+        with open(gh_sum, "a", encoding="utf-8") as f:
+            f.write(summary)
+
+    return 1 if has_bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
