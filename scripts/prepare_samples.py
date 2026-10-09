@@ -87,6 +87,12 @@ def main() -> int:
         is_zip = ".zip" in url.lower()
         dest = SAMPLES / (f"{label}.zip" if is_zip else f"{label}.exe")
         ok = download(url, dest)
+        # a "downloaded" exe that is not actually a PE (HTML error page etc.)
+        if ok and not is_zip and not pe_arch(dest):
+            print(f"{label:16} SKIP_NOPE  (not a PE: {dest.stat().st_size}B)")
+            manifest.append({"label": label, "notes": notes, "downloaded": False,
+                             "pes": [], "status": "SKIP_NOPE"})
+            continue
         entry = {"label": label, "notes": notes, "downloaded": ok,
                  "pes": [], "status": "OK" if ok else "SKIP_NODL"}
         if ok:

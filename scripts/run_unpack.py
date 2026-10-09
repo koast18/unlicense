@@ -2,10 +2,14 @@
 """Run unlicense against every prepared sample whose PE bitness matches this
 interpreter, collect per-sample outcomes, and write a markdown + JSON report.
 
+Target selection per sample label:
+  - prefer .exe over helper DLLs shipped in the archive
+  - prefer PEs whose packer version was detected (v2/v3) over unknown ones
+
 Statuses:
   OK          unpacked_<name> produced
-  FAIL        unlicense ran but no dump / nonzero exit
-  ERROR       crashed (traceback) — tail kept in report
+  FAIL        unlicense ran but no dump (timeout / error rc)
+  ERROR       crashed (frida attach failure, traceback)
   SKIP_ARCH   PE bitness != interpreter bitness (other matrix job handles it)
   SKIP_*      not downloadable / no PE
 
@@ -13,7 +17,6 @@ Exit code: 1 if any FAIL/ERROR, else 0.
 """
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -29,13 +32,22 @@ UNLICENSE_OEP_TIMEOUT = 120  # seconds to wait for OEP inside unlicense
 
 
 def interpreter_bitness() -> str:
-    return "x64" if (platform.machine() == "AMD64" and sys.maxsize > 2**32) or \
-        platform.machine() in ("AMD64", "x86_64") else "x86"
+    # process bitness, NOT platform.machine() (which reports AMD64 even for
+    # 32-bit python on 64-bit Windows)
+    return "x64" if sys.maxsize > 2**32 else "x86"
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
     subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                    capture_output=True)
+
+
+def select_targets(entry: dict) -> list:
+    """Prefer real main executables over helper DLLs, and known-version PEs."""
+    exes = [p for p in entry["pes"] if p["path"].lower().endswith(".exe")]
+    cands = exes or entry["pes"]
+    known = [p for p in cands if p.get("version") is not None]
+    return known or cands
 
 
 def run_one(pe_rel: str) -> dict:
@@ -49,8 +61,8 @@ def run_one(pe_rel: str) -> dict:
     cmd = [sys.executable, "-m", "unlicense", str(pe),
            "--timeout", str(UNLICENSE_OEP_TIMEOUT)]
     start = time.time()
-    log_lines = []
-    status = "FAIL"
+    result = {"status": "FAIL", "rc": -1, "seconds": 0.0,
+              "dumps": [], "tail": []}
     try:
         proc = subprocess.Popen(cmd, cwd=workdir, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
@@ -62,34 +74,33 @@ def run_one(pe_rel: str) -> dict:
             kill_tree(proc)
             out, _ = proc.communicate(timeout=30)
             rc = -999
-            status = "FAIL"
         log_lines = (out or "").splitlines()
-        dumps = list(workdir.glob("unpacked_*"))
-        dumps = [d for d in dumps if d.is_file() and d.stat().st_size > 1024]
+        dumps = [d for d in workdir.glob("unpacked_*")
+                 if d.is_file() and d.stat().st_size > 1024]
+
         if dumps:
             status = "OK"
-        elif rc == 0 and not dumps:
-            # unlicense exits 0 only after a successful dump normally; be safe
-            status = "FAIL"
-        elif "Traceback" in (out or ""):
-            status = "ERROR"
         elif rc == -999:
             status = "FAIL"
+        elif "Traceback" in (out or "") or "frida." in (out or ""):
+            status = "ERROR"
         else:
             status = "FAIL"
+
         result = {"status": status, "rc": rc,
                   "seconds": round(time.time() - start, 1),
-                  "dumps": [d.name for d in dumps]}
-        # collect artifacts
+                  "dumps": [d.name for d in dumps],
+                  "tail": log_lines[-6:]}
         out_dir = RESULTS / "unpacked"
         out_dir.mkdir(exist_ok=True)
         for d in dumps:
             shutil.copy(d, out_dir / f"{label}_{d.name}")
         (RESULTS / "logs").mkdir(exist_ok=True)
-        (RESULTS / "logs" / f"{label}.log").write_text("\n".join(log_lines[-400:]))
-        result["tail"] = log_lines[-6:]
+        (RESULTS / "logs" / f"{label}.log").write_text(
+            "\n".join(log_lines[-400:]))
     except Exception as exc:  # noqa: BLE001
-        result = {"status": "ERROR", "rc": -1, "seconds": 0,
+        result = {"status": "ERROR", "rc": -1,
+                  "seconds": round(time.time() - start, 1),
                   "dumps": [], "tail": [f"runner exception: {exc}"]}
     return result
 
@@ -98,7 +109,7 @@ def main() -> int:
     sys.path.insert(0, str(ROOT))
     manifest = json.loads((RESULTS / "manifest.json").read_text())
     bitness = interpreter_bitness()
-    print(f"interpreter bitness: {bitness}")
+    print(f"interpreter bitness: {bitness}", flush=True)
 
     rows = []
     has_bad = False
@@ -107,18 +118,19 @@ def main() -> int:
         if not entry["downloaded"] or not entry["pes"]:
             rows.append({"label": label, "pe": "-", "arch": "-",
                          "version": "-", "status": entry["status"],
-                         "rc": "-", "sec": 0, "tail": []})
+                         "rc": "-", "seconds": 0, "tail": []})
             continue
-        for pe_info in entry["pes"]:
+        for pe_info in select_targets(entry):
             if pe_info["arch"] != bitness:
-                rows.append({"label": label, "pe": Path(pe_info["path"]).name,
-                             "arch": pe_info["arch"],
+                rows.append({"label": label,
+                             "pe": Path(pe_info["path"]).name,
+                             "arch": pe_info["arch"] or "?",
                              "version": pe_info["version"],
-                             "status": "SKIP_ARCH", "rc": "-", "sec": 0,
-                             "tail": []})
+                             "status": "SKIP_ARCH", "rc": "-",
+                             "seconds": 0, "tail": []})
                 continue
-            print(f"[{label}] running {pe_info['path']} (v{pe_info['version']}) ...",
-                  flush=True)
+            print(f"[{label}] running {pe_info['path']} "
+                  f"(v{pe_info['version']}) ...", flush=True)
             res = run_one(pe_info["path"])
             print(f"[{label}] -> {res['status']} rc={res['rc']} "
                   f"{res['seconds']}s dumps={res['dumps']}", flush=True)
@@ -130,22 +142,23 @@ def main() -> int:
 
     report = {"bitness": bitness, "rows": rows,
               "ok": sum(1 for r in rows if r["status"] == "OK"),
-              "fail": sum(1 for r in rows if r["status"] in ("FAIL", "ERROR"))}
+              "fail": sum(1 for r in rows
+                          if r["status"] in ("FAIL", "ERROR"))}
     (RESULTS / f"report_{bitness}.json").write_text(json.dumps(report, indent=2))
 
-    # markdown summary
     md = [f"## Unpack report (python {bitness})", "",
           "| sample | PE | ver | status | rc | sec | tail |",
           "|---|---|---|---|---|---|---|"]
     for r in rows:
         tail = " / ".join(t.strip() for t in r.get("tail", [])[-2:])[:160]
-        tail = tail.replace("|", "\\|")
+        tail = tail.replace("|", "\\|").replace("\r", " ")
         md.append(f"| {r['label']} | {r['pe']} | {r['version']} | "
-                  f"{r['status']} | {r['rc']} | {r['sec']} | `{tail}` |")
+                  f"{r['status']} | {r['rc']} | {r.get('seconds', 0)} | "
+                  f"`{tail}` |")
     md.append("")
     md.append(f"**OK: {report['ok']}  FAIL/ERROR: {report['fail']}**")
     summary = "\n".join(md) + "\n"
-    print(summary)
+    print(summary, flush=True)
     gh_sum = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh_sum:
         with open(gh_sum, "a", encoding="utf-8") as f:
