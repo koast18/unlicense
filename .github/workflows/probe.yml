@@ -33,6 +33,9 @@ jobs:
       - name: Prepare samples
         run: python scripts/prepare_samples.py
 
+      - name: Stub missing runtime DLLs
+        run: python scripts/stub_missing_dlls.py
+
       - name: Probe injection (naked vs frida)
         run: python scripts/probe_injection.py
 
