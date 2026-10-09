@@ -29,6 +29,14 @@ jobs:
           python-version: "3.11"
           architecture: ${{ matrix.python_arch }}
 
+      # Themida-protected test binaries are often flagged by Defender, which
+      # kills them mid-injection ("refused to load frida-agent").
+      - name: Exclude workspace from Windows Defender
+        shell: pwsh
+        run: |
+          try { Add-MpPreference -ExclusionPath 'D:\a' -ErrorAction Stop; Write-Host 'exclusion added' }
+          catch { Write-Host "exclusion failed: $_" }
+
       - name: Install package
         run: |
           python -m pip install --upgrade pip
@@ -39,6 +47,11 @@ jobs:
 
       - name: Unpack samples
         run: python scripts/run_unpack.py
+
+      - name: Verify dumps (static + run)
+        if: always()
+        continue-on-error: true
+        run: python scripts/verify_dumps.py
 
       - name: Upload dumps, logs and reports
         if: always()
