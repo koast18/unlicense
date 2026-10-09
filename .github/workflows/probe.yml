@@ -36,6 +36,9 @@ jobs:
       - name: Probe injection (naked vs frida)
         run: python scripts/probe_injection.py
 
+      - name: Diagnose missing runtime DLLs
+        run: python scripts/diagnose_runtime.py
+
       - name: Upload probe report
         if: always()
         uses: actions/upload-artifact@v4
