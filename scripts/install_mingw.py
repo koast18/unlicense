@@ -53,8 +53,10 @@ def pick_asset(releases, arch: str):
                 continue
             if token not in name:
                 continue
-            # posix + ucrt runtime variants build fine on the runner
-            if "posix" in name and "ucrt" in name and "posix-seh" in name:
+            # winlibs ships several runtime variants; the posix ones build fine
+            # on the runner (dwarf for i686, seh for x86_64), so match on
+            # "posix" only rather than pinning one infix.
+            if "posix" in name and "ucrt" in name:
                 return name, asset["browser_download_url"]
     return None, None
 
@@ -109,7 +111,7 @@ def install(arch: str) -> dict:
     info["status"] = ("ok" if compiler.exists()
                       else f"extracted but {exe} missing")
     if compiler.exists():
-        marker.write_text(url, encoding="utf-8")
+        marker.write_text(str(url), encoding="utf-8")
         os.environ["PATH"] = info["bindir"] + os.pathsep + os.environ["PATH"]
     return info
 
