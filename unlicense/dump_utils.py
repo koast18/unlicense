@@ -118,6 +118,24 @@ def dump_pe(
 COM_DESCRIPTOR_INDEX = 14
 
 
+def describe_data_directories(pe_file_path: str) -> List[str]:
+    """Human-readable dump of the PE data directory array.
+
+    Diagnostic helper: the .NET decision hinges on a single entry, and when the
+    detection misfires the only way to tell "no COM descriptor" from "wrong
+    index" is to see every entry's index and RVA.
+    """
+    binary = lief.PE.parse(pe_file_path)
+    if binary is None:
+        return ["<unparseable>"]
+    entries = []
+    for i, data_dir in enumerate(lief_pe_data_directories(binary)):
+        if data_dir.rva or data_dir.size:
+            entries.append(f"[{i}] rva={hex(data_dir.rva)} "
+                           f"size={hex(data_dir.size)}")
+    return entries or ["<all zero>"]
+
+
 def is_dotnet_pe(pe_file_path: str) -> bool:
     """True if the PE carries a COM descriptor / CLR header.
 

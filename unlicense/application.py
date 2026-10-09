@@ -9,7 +9,7 @@ from typing import Optional
 import fire  # type: ignore
 
 from . import frida_exec, winlicense2, winlicense3
-from .dump_utils import dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, is_dotnet_pe, probe_text_sections
+from .dump_utils import describe_data_directories, dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, is_dotnet_pe, probe_text_sections
 from .logger import setup_logger
 from .version_detection import detect_winlicense_version
 
@@ -77,6 +77,8 @@ def run_unlicense(
     # unreachable. Detect them statically instead and dump straight after the
     # runtime has settled.
     dotnet = is_dotnet_pe(pe_to_dump)
+    LOG.info("Data directories: %s", describe_data_directories(pe_to_dump))
+    LOG.info(".NET image detected: %r", dotnet)
     if dotnet:
         LOG.info(".NET image detected (COM descriptor present), "
                  "dumping without OEP tracing")
