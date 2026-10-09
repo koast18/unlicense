@@ -279,8 +279,26 @@ def parse_exports(path: Path):
         return []
 
 
-def build_stub(dllname: str, entries, workdir: Path, env: dict,
-               out_dir: Path, cl: str = "cl") -> str:
+def find_mingw(arch: str):
+    """Locate a mingw-w64 cross compiler for `arch`.
+
+    MSVC's linker rewrites stdcall-decorated import names such as
+    `_BinkGoto@12` (it strips the `@12` when the internal symbol is undecorated),
+    so the resulting stub exports `_BinkGoto` and the loader rejects the image
+    with STATUS_ENTRYPOINT_NOT_FOUND. mingw-w64 emits the decorated name
+    verbatim, which is exactly what the import table asks for.
+    """
+    import shutil
+    for cc in (f"{arch}-w64-mingw32-gcc",
+               f"{'i686' if arch == 'x86' else 'x86_64'}-w64-mingw32-gcc"):
+        found = shutil.which(cc)
+        if found:
+            return found
+    return None
+
+
+def build_stub(dllname: str, entries, workdir: Path, env: dict | None,
+               out_dir: Path, cl: str = "cl", cc: str | None = None) -> str:
     # dedupe entries, keep order
     seen = set()
     uniq = []
@@ -289,6 +307,8 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
         if key not in seen:
             seen.add(key)
             uniq.append((kind, val))
+
+    workdir.mkdir(parents=True, exist_ok=True)
 
     c_lines = []
     def_lines = ["EXPORTS"]
@@ -316,6 +336,39 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
         ["__declspec(dllexport) int __stub_anchor(void) { return 0; }"]) + "\n")
     (workdir / "stub.def").write_text("\n".join(def_lines) + "\n")
 
+    want = {v for k, v in uniq if k == "name"}
+
+    def _finish(note: str) -> str:
+        got = set(parse_exports(workdir / dllname))
+        miss = sorted(want - got)
+        if miss:
+            return (f"{note}, MISSING {len(miss)} export(s): "
+                    f"{', '.join(miss[:5])}")
+        return f"{note}, all {len(want)} named exports resolved"
+
+    if cc:
+        # mingw-w64: no vcvars env needed, and decorated names survive intact
+        (workdir / "stub.c").write_text("\n".join(
+            [f'int {fn}(void) {{ return 0; }}' for fn in
+             (f"s{i}" for i in range(len(uniq)))] +
+            ["__declspec(dllexport) int __stub_anchor(void) { return 0; }"])
+            + "\n")
+        cmd = [cc, "-shared", "-O2", "-o", dllname, "stub.c", "stub.def"]
+        try:
+            r = subprocess.run(cmd, cwd=str(workdir), capture_output=True,
+                               text=True, timeout=300)
+        except Exception as exc:  # noqa: BLE001
+            return f"gcc failed to run ({cc}): {exc}"
+        if r.returncode != 0 or not (workdir / dllname).exists():
+            tail = (r.stderr or r.stdout or "")[-300:].replace("\n", " ")
+            return f"gcc rc={r.returncode}: {tail}"
+        out = _finish("built with mingw")
+        if "MISSING" in out:
+            return out
+        dest = out_dir / dllname
+        dest.write_bytes((workdir / dllname).read_bytes())
+        return out
+
     cmd = [cl, "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
            "/DEF:stub.def", f"/OUT:{dllname}"]
     try:
@@ -328,15 +381,10 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
         return f"cl rc={r.returncode}: {tail}"
     dest = out_dir / dllname
     dest.write_bytes((workdir / dllname).read_bytes())
-
-    want = {v for k, v in uniq if k == "name"}
-    got = set(parse_exports(dest))
-    missing = sorted(want - got)
-    if missing:
-        return (f"built but MISSING {len(missing)} export(s): "
-                f"{', '.join(missing[:5])}")
-    return (f"built ({len(uniq)} entries, {len(want)} named exports all "
-            f"resolved)")
+    out = _finish("built with msvc")
+    if "MISSING" in out:
+        return out
+    return out
 
 
 def main() -> int:
@@ -346,13 +394,19 @@ def main() -> int:
         print("FATAL: vcvarsall.bat not found (vswhere + Enterprise fallback)",
               flush=True)
     arch = "x64" if bitness == "x64" else "x86"
+    cc = find_mingw(arch)
+    if cc:
+        print(f"using mingw-w64 for stubs ({cc})", flush=True)
     setup = vc_env(vcvars, arch) if vcvars else None
     if setup:
         env, cl = setup
         print(f"MSVC env ready ({vcvars}, {arch}, cl={cl})", flush=True)
     else:
         env, cl = None, "cl"
-        print("FATAL: MSVC environment setup failed (see vc_env diagnostics)",
+        print("MSVC environment setup failed (see vc_env diagnostics)",
+              flush=True)
+    if not cc and not env:
+        print("FATAL: no stub compiler available (no mingw-w64, no MSVC)",
               flush=True)
 
     manifest = json.loads((RESULTS / "manifest.json").read_text())
@@ -391,23 +445,32 @@ def main() -> int:
         if not dll_missing:
             continue
         results = {}
+        # the full missing set, including the ones a junk-name filter or an
+        # empty export list hides, so the report shows what the loader still
+        # has to resolve at runtime
+        all_missing = sorted(imports)
+        print(f"[{entry['label']}] imports={len(imports)} "
+              f"missing={all_missing}", flush=True)
         for dll, ents in dll_missing.items():
-            if not env:
-                results[dll] = "no MSVC env"
+            if not env and not cc:
+                results[dll] = "no stub compiler"
                 continue
             wd = build_root / f"{entry['label']}_{dll}"
             wd.mkdir(parents=True, exist_ok=True)
-            # compile with the toolchain matching the PE, not this interpreter
+            # the stub must match the PE's bitness, not this interpreter's
             dll_arch = "x64" if pe_arch == "x64" else "x86"
-            denv, dcl = env, cl
-            if dll_arch != arch and vcvars:
-                alt = vc_env(vcvars, dll_arch)
-                if alt:
-                    denv, dcl = alt
-            res = build_stub(dll, ents, wd, denv, exe.parent, dcl)
+            denv, dcl, dcc = env, cl, cc
+            if dll_arch != arch:
+                dcc = find_mingw(dll_arch)
+                if not dcc and vcvars:
+                    alt = vc_env(vcvars, dll_arch)
+                    if alt:
+                        denv, dcl = alt
+            res = build_stub(dll, ents, wd, denv, exe.parent, dcl, dcc)
             results[dll] = res
             print(f"[{entry['label']}] {dll}: {res}", flush=True)
         rows.append({"label": entry["label"], "exe": exe.name,
+                     "imports": len(imports), "all_missing": all_missing,
                      "stubs": results})
 
     report = {"bitness": bitness, "rows": rows}
