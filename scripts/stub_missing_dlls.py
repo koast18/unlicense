@@ -121,18 +121,29 @@ def find_vcvars() -> Path | None:
 
 
 def vc_env(vcvars: Path, arch: str) -> dict | None:
+    import shutil
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             f'"{vcvars}" {arch} && set', shell=True,
-            capture_output=True, text=True, timeout=120).stdout
-    except Exception:  # noqa: BLE001
+            capture_output=True, timeout=180)
+        out = r.stdout.decode("mbcs", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        print(f"vc_env: run failed: {exc}", flush=True)
         return None
     env = {}
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
             env[k] = v
-    return env if "PATH" in env else None
+    pathkey = next((k for k in env if k.upper() == "PATH"), None)
+    if pathkey is None:
+        print(f"vc_env: no PATH key (vars={len(env)} rc={r.returncode}) "
+              f"stderr={r.stderr[:300]!r}", flush=True)
+        return None
+    if not shutil.which("cl", path=env[pathkey]):
+        print("vc_env: cl.exe not found in vcvars PATH", flush=True)
+        return None
+    return env
 
 
 def build_stub(dllname: str, entries, workdir: Path, env: dict,
@@ -180,11 +191,15 @@ def main() -> int:
     bitness = interpreter_bitness()
     vcvars = find_vcvars()
     if not vcvars:
-        print("FATAL: vcvarsall.bat not found", flush=True)
+        print("FATAL: vcvarsall.bat not found (vswhere + Enterprise fallback)",
+              flush=True)
     arch = "x64" if bitness == "x64" else "x86"
     env = vc_env(vcvars, arch) if vcvars else None
     if env:
         print(f"MSVC env ready ({vcvars}, {arch})", flush=True)
+    else:
+        print("FATAL: MSVC environment setup failed (see vc_env diagnostics)",
+              flush=True)
 
     manifest = json.loads((RESULTS / "manifest.json").read_text())
     build_root = ROOT / "results" / "stubs_build"
