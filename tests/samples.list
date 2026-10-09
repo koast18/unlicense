@@ -1,0 +1,14 @@
+# Sample targets for CI: LABEL<TAB>URL<TAB>NOTES
+# Sources: attachments in ergrelet/unlicense issues (public links).
+# Download failures are tolerated (marked FAILED in logs); classification skips missing files.
+vc_example	https://github.com/ergrelet/unlicense/files/9175246/vc_example_protected.zip	themida3 #35
+ragexe	https://github.com/ergrelet/unlicense/files/12566424/Ragexe.zip	winlicense? #105
+get1	https://github.com/ergrelet/unlicense/files/12566360/GET1.zip	#106
+drchost	https://github.com/ergrelet/unlicense/files/12307844/DrcHost.zip	#94
+test84	https://github.com/ergrelet/unlicense/files/11538688/test.zip	themida3 #84
+sample112	https://github.com/ergrelet/unlicense/files/12886941/sample.zip	winlicense strings #112
+unpack109	https://github.com/ergrelet/unlicense/files/12775098/Unpack.zip	oep timeout #109
+a12mini	https://github.com/ergrelet/unlicense/files/9387763/a12_mini.zip	#47
+b55	https://github.com/ergrelet/unlicense/files/9721901/b.zip	#55
+target51	https://github.com/ergrelet/unlicense/files/9543504/target.zip	#51
+final2022	https://www.dropbox.com/s/bla7juxmigo9zvb/FINAL%202022%20-.exe?dl=1	LICENSE-REQUIRED #45

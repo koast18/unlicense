@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Static pipeline: fetch public sample targets, identify packer version/arch.
+  # Uses only lief (not the full package) so linux doesn't need frida/scylla wheels.
+  classify-samples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install static deps
+        run: pip install "lief>=0.13,<0.14"
+
+      - name: Download samples
+        run: |
+          mkdir -p samples
+          while IFS=$'\t' read -r label url notes; do
+            case "$label" in ''|'#'*) continue;; esac
+            out="samples/$label"
+            case "$url" in *.zip*) out="$out.zip";; *) out="$out.exe";; esac
+            if curl -fsSL --retry 2 --max-time 120 -o "$out" "$url"; then
+              echo "OK   $label ($notes)"
+            else
+              echo "FAIL $label ($notes)"
+              rm -f "$out"
+            fi
+          done < tests/samples.list
+          ls -la samples/
+
+      - name: Classify samples
+        env:
+          PYTHONPATH: .
+        run: python scripts/classify_samples.py
+
+  # Windows smoke test: install real deps (frida, lief, unicorn) and make sure
+  # the package imports and the CLI responds on a real Windows runner.
+  smoke-windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: CLI smoke
+        run: python -m unlicense --help
+
+      - name: Frida sanity
+        run: python -c "import frida; print('frida', frida.__version__)"
