@@ -112,6 +112,12 @@ def dump_pe(
     return True
 
 
+#: Index of the COM descriptor entry in the PE data directory array. Spelled
+#: as a number because lief 0.13 (the pinned version) does not expose a
+#: `DATA_DIRECTORY.COM_DESCRIPTOR` enum member, and mypy runs in --strict mode.
+COM_DESCRIPTOR_INDEX = 14
+
+
 def is_dotnet_pe(pe_file_path: str) -> bool:
     """True if the PE carries a COM descriptor / CLR header.
 
@@ -123,8 +129,8 @@ def is_dotnet_pe(pe_file_path: str) -> bool:
     binary = lief.PE.parse(pe_file_path)
     if binary is None:
         return False
-    for data_dir in lief_pe_data_directories(binary):
-        if data_dir.type == lief.PE.DATA_DIRECTORY.COM_DESCRIPTOR:
+    for i, data_dir in enumerate(lief_pe_data_directories(binary)):
+        if i == COM_DESCRIPTOR_INDEX:
             return data_dir.rva != 0 and data_dir.size != 0
     return False
 
