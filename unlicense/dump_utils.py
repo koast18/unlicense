@@ -123,9 +123,10 @@ def is_dotnet_pe(pe_file_path: str) -> bool:
     binary = lief.PE.parse(pe_file_path)
     if binary is None:
         return False
-    com = binary.optional_header.data_directory(
-        lief.PE.DATA_DIRECTORY.COM_DESCRIPTOR)
-    return com is not None and com.rva != 0 and com.size != 0
+    for data_dir in lief_pe_data_directories(binary):
+        if data_dir.type == lief.PE.DATA_DIRECTORY.COM_DESCRIPTOR:
+            return data_dir.rva != 0 and data_dir.size != 0
+    return False
 
 
 def dump_dotnet_assembly(
