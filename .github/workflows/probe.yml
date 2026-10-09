@@ -1,0 +1,46 @@
+name: probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        python_arch: [x86, x64]
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Exclude workspace from Windows Defender
+        shell: pwsh
+        run: |
+          try { Add-MpPreference -ExclusionPath 'D:\a' -ErrorAction Stop; Write-Host 'exclusion added' }
+          catch { Write-Host "exclusion failed: $_" }
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: Prepare samples
+        run: python scripts/prepare_samples.py
+
+      - name: Probe injection (naked vs frida)
+        run: python scripts/probe_injection.py
+
+      - name: Upload probe report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.python_arch }}
+          path: results/probe_*.json
+          if-no-files-found: ignore
+          retention-days: 14
