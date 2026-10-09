@@ -2,19 +2,25 @@ import logging
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 import fire  # type: ignore
 
 from . import frida_exec, winlicense2, winlicense3
-from .dump_utils import dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, probe_text_sections
+from .dump_utils import dump_dotnet_assembly, dump_pe, get_section_ranges, interpreter_can_dump_pe, is_dotnet_pe, probe_text_sections
 from .logger import setup_logger
 from .version_detection import detect_winlicense_version
 
 # Supported Themida/WinLicense major versions
 SUPPORTED_VERSIONS = [2, 3]
 LOG = logging.getLogger("unlicense")
+
+# How long to let a .NET process settle before dumping it. The runtime has to
+# map the assembly and run the (unpacking) module ctor first; dumping earlier
+# captures a still-encrypted image.
+DOTNET_SETTLE_SECONDS = 10
 
 
 def main() -> None:
@@ -65,6 +71,33 @@ def run_unlicense(
     if text_section_ranges is None:
         LOG.error("Failed to automatically detect .text section")
         sys.exit(4)
+
+    # .NET images enter through the mscoree shim, so the native OEP tracer
+    # below never fires for them and the DOTNET branch after the wait would be
+    # unreachable. Detect them statically instead and dump straight after the
+    # runtime has settled.
+    dotnet = is_dotnet_pe(pe_to_dump)
+    if dotnet:
+        LOG.info(".NET image detected (COM descriptor present), "
+                 "dumping without OEP tracing")
+        process_controller = frida_exec.spawn_and_instrument(
+            pe_path, text_section_ranges, lambda *_: None)
+        try:
+            time.sleep(DOTNET_SETTLE_SECONDS)
+            main_ranges = process_controller.main_module_ranges
+            if not main_ranges:
+                LOG.error("Failed to read the image base of the .NET process")
+                sys.exit(4)
+            image_base = main_ranges[0].base
+            LOG.info("Dumping .NET assembly (base=%s)", hex(image_base))
+            if not dump_dotnet_assembly(process_controller, image_base):
+                LOG.error(".NET assembly dump failed")
+                sys.exit(5)
+            LOG.info("Output file has been saved at "
+                     "'unpacked_%s'", process_controller.main_module_name)
+        finally:
+            process_controller.terminate_process()
+        return
 
     dumped_image_base = 0
     dumped_oep = 0

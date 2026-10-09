@@ -112,6 +112,22 @@ def dump_pe(
     return True
 
 
+def is_dotnet_pe(pe_file_path: str) -> bool:
+    """True if the PE carries a COM descriptor / CLR header.
+
+    Must be answered *before* spawning: the native OEP tracer waits for the
+    unpacker's original entry point, which a .NET image never reaches through
+    that path (its entry is the mscoree shim), so the DOTNET branch in
+    application.py is unreachable if detection depends on the frida payload.
+    """
+    binary = lief.PE.parse(pe_file_path)
+    if binary is None:
+        return False
+    com = binary.optional_header.data_directory(
+        lief.PE.DATA_DIRECTORY.COM_DESCRIPTOR)
+    return com is not None and com.rva != 0 and com.size != 0
+
+
 def dump_dotnet_assembly(
     process_controller: ProcessController,
     image_base: int,
