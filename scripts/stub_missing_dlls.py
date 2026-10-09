@@ -29,6 +29,8 @@ RESULTS = ROOT / "results"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diagnose_runtime import dll_found  # noqa: E402
 
+_CL_PATH: str | None = None  # absolute cl.exe path resolved by vc_env()
+
 
 def interpreter_bitness() -> str:
     return "x64" if sys.maxsize > 2**32 else "x86"
@@ -134,15 +136,20 @@ def vc_env(vcvars: Path, arch: str) -> dict | None:
     for line in out.splitlines():
         if "=" in line:
             k, v = line.split("=", 1)
+            if not k or k.startswith("="):  # skip hidden =C:= style keys
+                continue
             env[k] = v
     pathkey = next((k for k in env if k.upper() == "PATH"), None)
     if pathkey is None:
         print(f"vc_env: no PATH key (vars={len(env)} rc={r.returncode}) "
               f"stderr={r.stderr[:300]!r}", flush=True)
         return None
-    if not shutil.which("cl", path=env[pathkey]):
+    cl = shutil.which("cl", path=env[pathkey])
+    if not cl:
         print("vc_env: cl.exe not found in vcvars PATH", flush=True)
         return None
+    global _CL_PATH
+    _CL_PATH = cl
     return env
 
 
@@ -172,13 +179,14 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
     (workdir / "stub.c").write_text("\n".join(c_lines) + "\n")
     (workdir / "stub.def").write_text("\n".join(def_lines) + "\n")
 
-    cmd = ["cl", "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
+    cl = _CL_PATH or "cl"
+    cmd = [cl, "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
            "/DEF:stub.def", f"/OUT:{dllname}"]
     try:
         r = subprocess.run(cmd, cwd=str(workdir), env=env,
                            capture_output=True, text=True, timeout=300)
     except Exception as exc:  # noqa: BLE001
-        return f"cl failed to run: {exc}"
+        return f"cl failed to run ({cl}): {exc}"
     if r.returncode != 0 or not (workdir / dllname).exists():
         tail = (r.stderr or r.stdout or "")[-300:].replace("\n", " ")
         return f"cl rc={r.returncode}: {tail}"
