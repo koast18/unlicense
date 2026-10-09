@@ -30,6 +30,11 @@ RESULTS = ROOT / "results"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diagnose_runtime import dll_found  # noqa: E402
 
+# A believable imported DLL filename: short, ASCII, no path separators and with
+# a PE module extension. Anything else is packer garbage in the import area.
+PLAUSIBLE_DLL = re.compile(
+    r"^[\w .()+@,-]{1,64}\.(dll|ocx|drv|sys|cpl|exe)$", re.IGNORECASE)
+
 
 
 
@@ -375,6 +380,13 @@ def main() -> int:
             continue
         dll_missing = {d: e for d, e in imports.items()
                        if not dll_found(d, exe.parent)}
+        # Packed samples leave garbage in the import area; a "DLL name" that
+        # is not a plausible filename must not reach the filesystem.
+        junk = sorted(d for d in dll_missing if not PLAUSIBLE_DLL.match(d))
+        for d in junk:
+            print(f"[{entry['label']}] ignoring junk import name: "
+                  f"{d!r}", flush=True)
+            dll_missing.pop(d)
         if not dll_missing:
             continue
         results = {}
