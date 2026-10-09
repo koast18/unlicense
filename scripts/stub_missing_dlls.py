@@ -289,11 +289,17 @@ def find_mingw(arch: str):
     verbatim, which is exactly what the import table asks for.
     """
     import shutil
-    for cc in (f"{arch}-w64-mingw32-gcc",
-               f"{'i686' if arch == 'x86' else 'x86_64'}-w64-mingw32-gcc"):
-        found = shutil.which(cc)
-        if found:
-            return found
+    exe = f"{'i686' if arch == 'x86' else 'x86_64'}-w64-mingw32-gcc"
+    found = shutil.which(exe)
+    if found:
+        return found
+    # choco installs mingw outside PATH and the refresh above can miss it
+    for d in (r"C:\mingw64\bin", r"C:\ProgramData\mingw64\mingw64\bin",
+              r"C:\tools\mingw64\bin", r"C:\msys64\mingw64\bin",
+              r"C:\msys64\ucrt64\bin", r"C:\msys64\mingw32\bin"):
+        cand = os.path.join(d, exe + ".exe")
+        if os.path.exists(cand):
+            return cand
     return None
 
 
