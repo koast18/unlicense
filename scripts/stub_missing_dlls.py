@@ -292,26 +292,29 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
 
     c_lines = []
     def_lines = ["EXPORTS"]
-    skipped = []
+    pragmas = []
     for i, (kind, val) in enumerate(uniq):
         fn = f"s{i}"
-        if kind == "name":
-            # .def lines are `name=internal` or `internal @ord NONAME`. Only
-            # whitespace, '=' and quote characters actually break the syntax --
-            # stdcall decorations such as `_fn@8` export fine.
-            if (not val or any(c in val for c in ' ="\'<>')
-                    or not re.fullmatch(r"[\w.+$?@]+", val)):
-                skipped.append(val)
-                continue
-            def_lines.append(f"{val}={fn}")
-        else:
-            def_lines.append(f"{fn} @{val} NONAME")
         c_lines.append(f"int {fn}(void) {{ return 0; }}")
+        if kind == "ord":
+            def_lines.append(f"{fn} @{val} NONAME")
+        elif any(c in val for c in ' ="\'<>'):
+            # neither .def nor /EXPORT can express this name; a stub without it
+            # would fail at load with STATUS_ENTRYPOINT_NOT_FOUND
+            def_lines.append(f"{fn} @{1000 + i} NONAME")
+        elif "@" in val:
+            # A .def line `name=internal` breaks on '@' (the linker reads it as
+            # an ordinal suffix), so stdcall-decorated names such as
+            # `_BinkGoto@12` go through /EXPORT pragmas, which pass the name
+            # through verbatim.
+            pragmas.append(f'#pragma comment(linker, "/EXPORT:{val}={fn}")')
+        else:
+            def_lines.append(f"{val}={fn}")
     # A DLL with an empty export table is still a loadable image, which is
     # what ordinal-only delay imports need.
-    (workdir / "stub.c").write_text(
-        "\n".join(c_lines + ["__declspec(dllexport) int __stub_anchor(void)"
-                            " { return 0; }"]) + "\n")
+    (workdir / "stub.c").write_text("\n".join(
+        pragmas + c_lines +
+        ["__declspec(dllexport) int __stub_anchor(void) { return 0; }"]) + "\n")
     (workdir / "stub.def").write_text("\n".join(def_lines) + "\n")
 
     cmd = [cl, "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
@@ -327,15 +330,14 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
     dest = out_dir / dllname
     dest.write_bytes((workdir / dllname).read_bytes())
 
-    want = {v for k, v in uniq if k == "name"} - set(skipped)
+    want = {v for k, v in uniq if k == "name"}
     got = set(parse_exports(dest))
     missing = sorted(want - got)
     if missing:
         return (f"built but MISSING {len(missing)} export(s): "
                 f"{', '.join(missing[:5])}")
-    note = f", {len(skipped)} name(s) unexpressible in .def" if skipped else ""
     return (f"built ({len(uniq)} entries, {len(want)} named exports all "
-            f"resolved{note})")
+            f"resolved)")
 
 
 def main() -> int:
