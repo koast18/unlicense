@@ -300,6 +300,11 @@ def find_mingw(arch: str):
         cand = os.path.join(d, exe + ".exe")
         if os.path.exists(cand):
             return cand
+    # a toolchain fetched by scripts/install_ming.py for exactly this arch
+    for sub in ("mingw32", "mingw64"):
+        cand = ROOT / "tools" / "mingw" / arch / sub / "bin" / (exe + ".exe")
+        if cand.exists():
+            return str(cand)
     return None
 
 

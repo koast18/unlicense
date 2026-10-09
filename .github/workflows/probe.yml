@@ -30,12 +30,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
 
-      - name: Install mingw-w64 (exports stdcall-decorated names verbatim)
-        shell: pwsh
-        run: |
-          choco install mingw -y --no-progress --limit-output
-          $env:PATH = [Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + [Environment]::GetEnvironmentVariable('PATH','User')
-          (Get-Command i686-w64-mingw32-gcc -ErrorAction SilentlyContinue) -and (Get-Command x86_64-w64-mingw32-gcc -ErrorAction SilentlyContinue)
+      - name: Fetch mingw-w64 for this architecture (exports stdcall names verbatim)
+        run: python scripts/install_mingw.py
 
       - name: Prepare samples
         run: python scripts/prepare_samples.py

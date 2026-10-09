@@ -38,3 +38,7 @@ MANIFEST.in
 /releases/*
 pip-wheel-metadata
 
+tools/
+results/
+samples/
+runs/
