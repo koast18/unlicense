@@ -29,7 +29,7 @@ RESULTS = ROOT / "results"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diagnose_runtime import dll_found  # noqa: E402
 
-_CL_PATH: str | None = None  # absolute cl.exe path resolved by vc_env()
+
 
 
 def interpreter_bitness() -> str:
@@ -122,7 +122,13 @@ def find_vcvars() -> Path | None:
     return cand if cand.exists() else None
 
 
-def vc_env(vcvars: Path, arch: str) -> dict | None:
+def vc_env(vcvars: Path, arch: str):
+    """Return (env, cl_path) for the given toolchain arch.
+
+    Windows CreateProcess resolves the program name against the *parent*
+    process PATH, so passing env with a vcvars PATH is not enough to run
+    `cl` -- it must be invoked by absolute path.
+    """
     import shutil
     try:
         r = subprocess.run(
@@ -130,7 +136,7 @@ def vc_env(vcvars: Path, arch: str) -> dict | None:
             capture_output=True, timeout=180)
         out = r.stdout.decode("mbcs", errors="replace")
     except Exception as exc:  # noqa: BLE001
-        print(f"vc_env: run failed: {exc}", flush=True)
+        print(f"vc_env({arch}): run failed: {exc}", flush=True)
         return None
     env = {}
     for line in out.splitlines():
@@ -141,20 +147,18 @@ def vc_env(vcvars: Path, arch: str) -> dict | None:
             env[k] = v
     pathkey = next((k for k in env if k.upper() == "PATH"), None)
     if pathkey is None:
-        print(f"vc_env: no PATH key (vars={len(env)} rc={r.returncode}) "
+        print(f"vc_env({arch}): no PATH key (vars={len(env)} rc={r.returncode}) "
               f"stderr={r.stderr[:300]!r}", flush=True)
         return None
     cl = shutil.which("cl", path=env[pathkey])
     if not cl:
-        print("vc_env: cl.exe not found in vcvars PATH", flush=True)
+        print(f"vc_env({arch}): cl.exe not found in vcvars PATH", flush=True)
         return None
-    global _CL_PATH
-    _CL_PATH = cl
-    return env
+    return env, cl
 
 
 def build_stub(dllname: str, entries, workdir: Path, env: dict,
-               out_dir: Path) -> str:
+               out_dir: Path, cl: str = "cl") -> str:
     # dedupe entries, keep order
     seen = set()
     uniq = []
@@ -179,7 +183,6 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
     (workdir / "stub.c").write_text("\n".join(c_lines) + "\n")
     (workdir / "stub.def").write_text("\n".join(def_lines) + "\n")
 
-    cl = _CL_PATH or "cl"
     cmd = [cl, "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
            "/DEF:stub.def", f"/OUT:{dllname}"]
     try:
@@ -202,10 +205,12 @@ def main() -> int:
         print("FATAL: vcvarsall.bat not found (vswhere + Enterprise fallback)",
               flush=True)
     arch = "x64" if bitness == "x64" else "x86"
-    env = vc_env(vcvars, arch) if vcvars else None
-    if env:
-        print(f"MSVC env ready ({vcvars}, {arch})", flush=True)
+    setup = vc_env(vcvars, arch) if vcvars else None
+    if setup:
+        env, cl = setup
+        print(f"MSVC env ready ({vcvars}, {arch}, cl={cl})", flush=True)
     else:
+        env, cl = None, "cl"
         print("FATAL: MSVC environment setup failed (see vc_env diagnostics)",
               flush=True)
 
@@ -240,12 +245,14 @@ def main() -> int:
                 continue
             wd = build_root / f"{entry['label']}_{dll}"
             wd.mkdir(parents=True, exist_ok=True)
-            # compile with arch matching the PE, not this interpreter
+            # compile with the toolchain matching the PE, not this interpreter
             dll_arch = "x64" if pe_arch == "x64" else "x86"
-            denv = env
-            if dll_arch != arch:
-                denv = vc_env(vcvars, dll_arch) or env
-            res = build_stub(dll, ents, wd, denv, exe.parent)
+            denv, dcl = env, cl
+            if dll_arch != arch and vcvars:
+                alt = vc_env(vcvars, dll_arch)
+                if alt:
+                    denv, dcl = alt
+            res = build_stub(dll, ents, wd, denv, exe.parent, dcl)
             results[dll] = res
             print(f"[{entry['label']}] {dll}: {res}", flush=True)
         rows.append({"label": entry["label"], "exe": exe.name,
