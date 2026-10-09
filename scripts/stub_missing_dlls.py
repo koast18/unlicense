@@ -125,7 +125,12 @@ def parse_imports_full(path: Path):
             norm = (lambda v: v - image_base) if not (attrs & 1) else (lambda v: v)
             no = rva2off(norm(name_va))
             if no is not None:
-                dll = data[no:data.index(b"\0", no)].decode("latin1", "replace")
+                end = data.find(b"\0", no)
+                if end == -1:
+                    # Some packers leave the name unterminated at the section
+                    # boundary; fall back to a bounded slice.
+                    end = min(no + 128, len(data))
+                dll = data[no:end].decode("latin1", "replace")
                 out.append((dll, thunk_entries(norm(int_rva)) +
                             thunk_entries(norm(iat_rva))))
             do += 32
@@ -150,7 +155,10 @@ def parse_imports_full(path: Path):
         no = rva2off(name_rva)
         if no is None:
             break
-        dll = data[no:data.index(b"\0", no)].decode("latin1", "replace")
+        dll_end = data.find(b"\0", no)
+        if dll_end == -1:
+            break
+        dll = data[no:dll_end].decode("latin1", "replace")
         # Packers routinely wipe OriginalFirstThunk, and on disk the IAT holds
         # unresolved hints -- so union both arrays rather than trusting either.
         entries = thunk_entries(ilt_rva) + thunk_entries(iat_rva)
@@ -283,10 +291,11 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
     for i, (kind, val) in enumerate(uniq):
         fn = f"s{i}"
         if kind == "name":
-            # .def lines are `name=internal` or `internal @ord NONAME`; a name
-            # containing spaces, '=' or quotes cannot be expressed there.
-            if (not val or any(c in val for c in ' ="\'<>\t\r\n')
-                    or not re.fullmatch(r"[A-Za-z_.$?@][\w.+$?@]*", val)):
+            # .def lines are `name=internal` or `internal @ord NONAME`. Only
+            # whitespace, '=' and quote characters actually break the syntax --
+            # stdcall decorations such as `_fn@8` export fine.
+            if (not val or any(c in val for c in ' ="\'<>')
+                    or not re.fullmatch(r"[\w.+$?@]+", val)):
                 skipped.append(val)
                 continue
             def_lines.append(f"{val}={fn}")
@@ -355,7 +364,11 @@ def main() -> int:
         if not exes:
             continue
         exe = ROOT / exes[0]["path"]
-        parsed = parse_imports_full(exe)
+        try:
+            parsed = parse_imports_full(exe)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{entry['label']}] import parse failed: {exc}", flush=True)
+            continue
         if isinstance(parsed, tuple) and len(parsed) == 3:
             imports, pe_arch, delay_seen = parsed
         else:
