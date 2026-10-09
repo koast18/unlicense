@@ -19,6 +19,7 @@ Exit 0 always (report-driven; failures stay visible in the table).
 """
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -63,42 +64,102 @@ def parse_imports_full(path: Path):
                 return rawptr + (rva - va)
         return None
 
+    def thunk_entries(rva):
+        """Parse an array of thunks -> [('name', str) | ('ord', int), ...]."""
+        out = []
+        to = rva2off(rva) if rva else None
+        if to is None:
+            return out
+        step = 8 if is64 else 4
+        fmt = "<Q" if is64 else "<I"
+        mask = 1 << 63 if is64 else 1 << 31
+        for _ in range(2048):
+            if to + step > len(data):
+                break
+            raw, = struct.unpack_from(fmt, data, to)
+            if raw == 0:
+                break
+            if raw & mask:
+                out.append(("ord", raw & 0xFFFF))
+            else:
+                # IMAGE_IMPORT_BY_NAME is {WORD Hint; CHAR Name[]} in both
+                # PE32 and PE32+, so the string starts 2 bytes past the RVA.
+                ho = rva2off(raw)
+                if ho is not None and ho + 2 < len(data):
+                    end = data.find(b"\0", ho + 2)
+                    if end == -1:
+                        break
+                    out.append(("name", data[ho + 2:end]
+                                .decode("latin1", "replace")))
+            to += step
+        return out
+
+    def delay_import_dlls():
+        """DLLs from the delay-import directory (index 13).
+
+        tera65-style samples load game middleware lazily; those names never
+        appear in the normal import table, so without this the stub set is
+        incomplete and the loader still fails with STATUS_DLL_NOT_FOUND.
+        """
+        try:
+            delay_rva = struct.unpack_from("<I", data, dd_off + 13 * 8)[0]
+        except struct.error:
+            return []
+        if not delay_rva:
+            return []
+        do = rva2off(delay_rva)
+        if do is None:
+            return []
+        image_base = struct.unpack_from(
+            "<Q" if is64 else "<I", data,
+            opt_off + (24 if is64 else 28))[0]
+        out = []
+        for _ in range(256):
+            if do + 32 > len(data):
+                break
+            attrs, name_va, _, iat_rva, int_rva = struct.unpack_from(
+                "<IIIII", data, do)
+            if name_va == 0 and attrs == 0:
+                break
+            # bit 0 clear means the fields are VAs, not RVAs
+            norm = (lambda v: v - image_base) if not (attrs & 1) else (lambda v: v)
+            no = rva2off(norm(name_va))
+            if no is not None:
+                dll = data[no:data.index(b"\0", no)].decode("latin1", "replace")
+                out.append((dll, thunk_entries(norm(int_rva)) +
+                            thunk_entries(norm(iat_rva))))
+            do += 32
+        return out
+
     result = {}
+    delay_seen = set()
     if not import_rva:
-        return result
+        d = dict(delay_import_dlls())
+        delay_seen = set(d)
+        return d, ("x64" if machine == 0x8664 else "x86"), delay_seen
     off = rva2off(import_rva)
     if off is None:
-        return result
+        d = dict(delay_import_dlls())
+        delay_seen = set(d)
+        return d, ("x64" if machine == 0x8664 else "x86"), delay_seen
     while True:
         ilt_rva, _, _, name_rva, iat_rva = struct.unpack_from(
             "<IIIII", data, off)
-        if name_rva == 0:
+        if name_rva == 0 and ilt_rva == 0 and iat_rva == 0:
             break
         no = rva2off(name_rva)
         if no is None:
             break
         dll = data[no:data.index(b"\0", no)].decode("latin1", "replace")
-        thunk_rva = ilt_rva or iat_rva
-        entries = []
-        to = rva2off(thunk_rva)
-        if to is not None:
-            step = 8 if is64 else 4
-            mask = 1 << 63 if is64 else 1 << 31
-            for _ in range(1024):
-                raw, = struct.unpack_from("<Q" if is64 else "<I", data, to)
-                if raw == 0:
-                    break
-                if raw & mask:
-                    entries.append(("ord", raw & 0xFFFF))
-                else:
-                    ho = rva2off(raw + (2 if is64 else 0))
-                    if ho is not None:
-                        nm = data[ho:data.index(b"\0", ho)]
-                        entries.append(("name", nm.decode("latin1", "replace")))
-                to += step
+        # Packers routinely wipe OriginalFirstThunk, and on disk the IAT holds
+        # unresolved hints -- so union both arrays rather than trusting either.
+        entries = thunk_entries(ilt_rva) + thunk_entries(iat_rva)
         result.setdefault(dll, []).extend(entries)
         off += 20
-    return result, ("x64" if machine == 0x8664 else "x86")
+    for dll, entries in delay_import_dlls():
+        result.setdefault(dll, []).extend(entries)
+        delay_seen.add(dll)
+    return result, ("x64" if machine == 0x8664 else "x86"), delay_seen
 
 
 def find_vcvars() -> Path | None:
@@ -157,6 +218,54 @@ def vc_env(vcvars: Path, arch: str):
     return env, cl
 
 
+def parse_exports(path: Path):
+    """Export names of a built PE, so we can verify the stub really publishes
+    everything the sample imports (a silently short export table shows up on
+    Windows as STATUS_ENTRYPOINT_NOT_FOUND, not as a build error)."""
+    data = path.read_bytes()
+    try:
+        e = struct.unpack_from("<I", data, 0x3C)[0]
+        opt_off = e + 24
+        is64 = struct.unpack_from("<H", data, opt_off)[0] == 0x20B
+        dd_off = opt_off + (112 if is64 else 96)
+        nsec = struct.unpack_from("<H", data, e + 6)[0]
+        sec_off = opt_off + struct.unpack_from("<H", data, e + 20)[0]
+        secs = []
+        for i in range(nsec):
+            o = sec_off + i * 40
+            vsize, va, rawsz, rawptr = struct.unpack_from("<IIII", data, o + 8)
+            secs.append((va, vsize, rawptr, rawsz))
+        exp_rva = struct.unpack_from("<I", data, dd_off)[0]
+        if not exp_rva:
+            return []
+
+        def rva2off(rva):
+            for va, vsize, rawptr, rawsz in secs:
+                if va <= rva < va + max(vsize, rawsz):
+                    return rawptr + (rva - va)
+            return None
+
+        o = rva2off(exp_rva)
+        nnames = struct.unpack_from("<I", data, o + 24)[0]
+        names_rva = struct.unpack_from("<I", data, o + 32)[0]
+        nt = rva2off(names_rva)
+        if nt is None:
+            return []
+        out = []
+        for i in range(nnames):
+            nr = struct.unpack_from("<I", data, nt + 4 * i)[0]
+            no = rva2off(nr)
+            if no is None:
+                continue
+            end = data.find(b"\0", no)
+            if end == -1:
+                continue
+            out.append(data[no:end].decode("latin1", "replace"))
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def build_stub(dllname: str, entries, workdir: Path, env: dict,
                out_dir: Path, cl: str = "cl") -> str:
     # dedupe entries, keep order
@@ -170,17 +279,25 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
 
     c_lines = []
     def_lines = ["EXPORTS"]
+    skipped = []
     for i, (kind, val) in enumerate(uniq):
         fn = f"s{i}"
-        c_lines.append(f"int {fn}(void) {{ return 0; }}")
         if kind == "name":
+            # .def lines are `name=internal` or `internal @ord NONAME`; a name
+            # containing spaces, '=' or quotes cannot be expressed there.
+            if (not val or any(c in val for c in ' ="\'<>\t\r\n')
+                    or not re.fullmatch(r"[A-Za-z_.$?@][\w.+$?@]*", val)):
+                skipped.append(val)
+                continue
             def_lines.append(f"{val}={fn}")
         else:
             def_lines.append(f"{fn} @{val} NONAME")
-    if not uniq:
-        return "no entries to stub"
-
-    (workdir / "stub.c").write_text("\n".join(c_lines) + "\n")
+        c_lines.append(f"int {fn}(void) {{ return 0; }}")
+    # A DLL with an empty export table is still a loadable image, which is
+    # what ordinal-only delay imports need.
+    (workdir / "stub.c").write_text(
+        "\n".join(c_lines + ["__declspec(dllexport) int __stub_anchor(void)"
+                            " { return 0; }"]) + "\n")
     (workdir / "stub.def").write_text("\n".join(def_lines) + "\n")
 
     cmd = [cl, "/nologo", "/LD", "/MT", "/O2", "stub.c", "/link",
@@ -195,7 +312,16 @@ def build_stub(dllname: str, entries, workdir: Path, env: dict,
         return f"cl rc={r.returncode}: {tail}"
     dest = out_dir / dllname
     dest.write_bytes((workdir / dllname).read_bytes())
-    return f"built ({len(uniq)} exports)"
+
+    want = {v for k, v in uniq if k == "name"} - set(skipped)
+    got = set(parse_exports(dest))
+    missing = sorted(want - got)
+    if missing:
+        return (f"built but MISSING {len(missing)} export(s): "
+                f"{', '.join(missing[:5])}")
+    note = f", {len(skipped)} name(s) unexpressible in .def" if skipped else ""
+    return (f"built ({len(uniq)} entries, {len(want)} named exports all "
+            f"resolved{note})")
 
 
 def main() -> int:
@@ -230,8 +356,8 @@ def main() -> int:
             continue
         exe = ROOT / exes[0]["path"]
         parsed = parse_imports_full(exe)
-        if isinstance(parsed, tuple):
-            imports, pe_arch = parsed
+        if isinstance(parsed, tuple) and len(parsed) == 3:
+            imports, pe_arch, delay_seen = parsed
         else:
             continue
         dll_missing = {d: e for d, e in imports.items()
