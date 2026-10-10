@@ -394,7 +394,80 @@ function installWindowsHooks() {
     }
 }
 
-/* ------------------------------------------------------------------ Linux */
+/* ---------------------------------------------------- diagnostic hooks --- */
+
+/* Why this exists: when Stage 1 never takes its landmark, the question is
+ * always "did the program reach the license verification at all, or is it
+ * stuck earlier?" A dialog answers that directly. WinLicense reports a
+ * rejected license with a MessageBox, so a logged message box means the
+ * license path ran to completion; no message box at all means the program
+ * never got there and the problem is upstream (anti-VM probing, a missing
+ * dependency, or a blocked initialisation step).
+ *
+ * ExitProcess/TerminateProcess are logged for the same reason: a process
+ * that leaves on its own is telling us it gave up.
+ */
+function installDiagnosticHooks() {
+    const boxes = [["user32.dll", "MessageBoxA", false],
+                   ["user32.dll", "MessageBoxW", true]];
+    for (const [mod, name, wide] of boxes) {
+        let address = null;
+        try {
+            address = Module.getExportByName(mod, name);
+        } catch (e) {
+            continue;
+        }
+        if (address === null) {
+            continue;
+        }
+        try {
+            plan.hooks.push(Interceptor.attach(address, {
+                onEnter: function (args) {
+                    try {
+                        const text = wide
+                            ? args[1].readUtf16String()
+                            : args[1].readAnsiString();
+                        const caption = wide
+                            ? args[2].readUtf16String()
+                            : args[2].readAnsiString();
+                        plan.messageBoxes = (plan.messageBoxes || 0) + 1;
+                        emit({ spike: "messagebox", fn: name,
+                               caption: caption, text: text });
+                    } catch (e) {
+                        emit({ spike: "messagebox", fn: name,
+                               error: String(e) });
+                    }
+                }
+            }));
+        } catch (e) {
+            report.errors.push("hook " + name + ": " + String(e));
+        }
+    }
+
+    const exits = [["kernel32.dll", "ExitProcess"],
+                   ["kernel32.dll", "TerminateProcess"]];
+    for (const [mod, name] of exits) {
+        let address = null;
+        try {
+            address = Module.getExportByName(mod, name);
+        } catch (e) {
+            continue;
+        }
+        if (address === null) {
+            continue;
+        }
+        try {
+            plan.hooks.push(Interceptor.attach(address, {
+                onEnter: function (args) {
+                    emit({ spike: "exit", fn: name,
+                           code: args[0].toString() });
+                }
+            }));
+        } catch (e) {
+            report.errors.push("hook " + name + ": " + String(e));
+        }
+    }
+}
 
 function installLinuxHooks() {
     const libc = "libc.so.6";
@@ -1223,6 +1296,7 @@ rpc.exports = {
 
         if (IS_WINDOWS) {
             installWindowsHooks();
+            installDiagnosticHooks();
         } else {
             installLinuxHooks();
         }
@@ -1334,6 +1408,7 @@ rpc.exports = {
             stage1Rearms: plan.stage1.rearms,
             stage1HwBreakActive: plan.hwBreakActive,
             stage1HwBreakHits: plan.hwBreakHits,
+            messageBoxes: plan.messageBoxes || 0,
             stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
