@@ -395,13 +395,28 @@ function stage2FollowThreads() {
     } catch (e) {
         /* best effort */
     }
+    /* Follow, but never unfollow. The counters settled this: the window was
+     * seeing ~151 instructions in 8s (~19/s), i.e. the transform was barely
+     * running at all -- the threads had already been unfollowed when Stage 0
+     * finished, so flushing a cache that nothing was executing did nothing.
+     * The earlier hang came from Stalker.unfollow being called on the thread
+     * that had just taken the guard violation, not from follow. */
+    let followed = 0;
+    for (const thread of Process.enumerateThreads()) {
+        try {
+            Stalker.follow(thread.id, { transform: install });
+            followed++;
+        } catch (e) {
+            /* best effort */
+        }
+    }
     s2.insideAtFollow = stats.inside;
     s2.instructionsAtFollow = stats.instructions;
     s2.outsideAtFollow = stats.outside;
-    stage2Log("following", "flushed=" + flushed + " threads=" +
-        Process.enumerateThreads().length + " (already followed from Stage 0;" +
-        " instructions=" + stats.instructions + " inside=" + stats.inside +
-        " outside=" + stats.outside + ")");
+    stage2Log("following", "flushed=" + flushed + " followed=" + followed +
+        "/" + Process.enumerateThreads().length + " instructions=" +
+        stats.instructions + " inside=" + stats.inside +
+        " outside=" + stats.outside);
     /* Bounded window: if the comparison never shows up, say so rather than
      * leaving the target slowed down for the rest of the run. */
     setTimeout(function () {
