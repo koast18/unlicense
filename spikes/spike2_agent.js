@@ -901,8 +901,51 @@ function stage1IsSystemModule(module) {
     return path.indexOf("\\windows\\") !== -1;
 }
 
+/* True when the address is backed by executable memory. Interceptor.attach
+ * rewrites the bytes at the target address, so attaching to a data address
+ * (a stack slot holding a buffer pointer, say) corrupts that buffer -- which
+ * is exactly what crashed the x86 mimic run with an access violation after
+ * it "hooked" the license copy itself. */
+function stage1IsExecutable(address) {
+    if (address === null || address === undefined || address.isNull()) {
+        return false;
+    }
+    try {
+        const range = Process.findRangeByAddress(address);
+        return range !== null && range.protection.indexOf("x") !== -1;
+    } catch (e) {
+        return false;
+    }
+}
+
 function stage1ReturnCandidates(context) {
     const slots = [];
+    /* Thread.backtrace resolves the real call stack for a context, which is
+     * far more reliable than guessing stack offsets: the frame size of the
+     * function that read the license varies with the build, and the x64
+     * mimic run showed the return address sitting beyond every offset the
+     * old scan tried. backtrace[0] is the return address of the function
+     * that performed the read, i.e. the caller we want. */
+    let frames = [];
+    try {
+        frames = Thread.backtrace(context, Backtracer.ACCURATE);
+    } catch (e) {
+        frames = [];
+    }
+    for (const frame of frames) {
+        const module = Process.findModuleByAddress(frame);
+        slots.push({
+            offset: null,
+            label: "frame",
+            value: frame.toString(),
+            inModule: !stage1IsSystemModule(module) &&
+                stage1IsExecutable(frame)
+        });
+    }
+    if (frames.length > 0) {
+        return slots;
+    }
+    /* Fallback when no backtrace is available: the original offset scan. */
     const sp = context[SP_REG];
     for (const offset of plan.retCandidates) {
         try {
@@ -910,14 +953,23 @@ function stage1ReturnCandidates(context) {
             const module = Process.findModuleByAddress(value);
             slots.push({
                 offset: offset,
+                label: "sp+" + offset.toString(16),
                 value: value.toString(),
-                inModule: !stage1IsSystemModule(module)
+                inModule: !stage1IsSystemModule(module) &&
+                    stage1IsExecutable(value)
             });
         } catch (e) {
-            slots.push({ offset: offset, value: "unreadable" });
+            slots.push({ offset: offset, label: "sp+" +
+                offset.toString(16), value: "unreadable" });
         }
     }
     return slots;
+}
+
+function stage1CandidateLabel(candidate) {
+    return candidate.label !== undefined
+        ? candidate.label
+        : "sp+" + candidate.offset.toString(16);
 }
 
 /* ---------------------------------------------------------------------
@@ -1116,7 +1168,7 @@ function stage1TakeLandmark(context, label) {
     stage1.retCandidates = candidates;
     stage1Log("sub1-lic-page-access", label + " pc=" + context[PC_REG] + " " +
         candidates.map(function (candidate) {
-            return "[sp+" + candidate.offset.toString(16) + "]=" +
+            return "[" + stage1CandidateLabel(candidate) + "]=" +
                 candidate.value + (candidate.inModule ? " (code)" : "");
         }).join(" "));
     /* The guard bit is already cleared by the OS, so the instruction will
@@ -1127,7 +1179,7 @@ function stage1TakeLandmark(context, label) {
      * logging which slot it was pins the offset down for later runs. */
     const usable = candidates.filter(function (candidate) {
         return candidate.inModule;
-    });
+    }).slice(0, 6);
     if (usable.length === 0) {
         stage1Log("sub1-no-code-return-candidate", "logged candidates above");
         /* No stack slot held a code address, so there is nothing to hook.
@@ -1137,11 +1189,11 @@ function stage1TakeLandmark(context, label) {
     }
     stage1.sub = 2;
     stage1.retCandidatesInModule = usable.map(function (candidate) {
-        return candidate.offset.toString(16) + "=" + candidate.value;
+        return stage1CandidateLabel(candidate) + "=" + candidate.value;
     });
     for (const candidate of usable) {
         const address = ptr(candidate.value);
-        const offset = candidate.offset;
+        const slotLabel = stage1CandidateLabel(candidate);
         setTimeout(function () {
             try {
                 plan.hooks.push(Interceptor.attach(address, {
@@ -1150,7 +1202,7 @@ function stage1TakeLandmark(context, label) {
                             if (plan.stage1.sub !== 2) {
                                 return;
                             }
-                            plan.stage1.retSlotOffset = offset;
+                            plan.stage1.retSlotOffset = slotLabel;
                             plan.stage1.retToRsa = address.toString();
                             stage1BackInRsaExptmod(this.context);
                         } catch (e) {
@@ -1158,8 +1210,8 @@ function stage1TakeLandmark(context, label) {
                         }
                     }
                 }));
-                stage1Log("sub2-hooked", "candidate [sp+" +
-                    offset.toString(16) + "] = " + address);
+                stage1Log("sub2-hooked", "candidate [" + slotLabel +
+                    "] = " + address);
             } catch (e) {
                 stage1Log("sub2-hook-failed", String(e) + " for " + address);
             }
