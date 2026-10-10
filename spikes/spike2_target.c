@@ -240,10 +240,16 @@ int main(int argc, char **argv) {
          * pause between blocks gives the agent time to arm. */
         /* dec_sections blocks are decrypted with the swapped-in key, and then
          * the protection verifies the signature with its own key. The port
-         * only completes -- restoring key1 and setting stage1Complete -- on
-         * the call AFTER dec_sections, so the loop must run dec_sections + 1
-         * times or the last state transition is never reached. */
-        blocks = (int)(size / 0x80) + 1;
+         * completes -- restoring key1 and setting stage1Complete -- on the
+         * call AFTER dec_sections.
+         *
+         * Run two extra blocks rather than one. Unlike PIN, which
+         * instruments every instruction from the start, this port installs
+         * its mp_exptmod hook at runtime from a deferred callback, so it can
+         * miss call #1 (x64 did: 32 observed calls and no completion, while
+         * x86 won the race and saw all 33). The extra block keeps the
+         * completion transition reachable either way. */
+        blocks = (int)(size / 0x80) + 2;
         for (block = 0; block < blocks; block++) {
             rsa_exptmod(&g, &x, &p, &y,
                         (const volatile unsigned char *)dst, (int)size);
