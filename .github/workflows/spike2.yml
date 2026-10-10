@@ -75,8 +75,11 @@ jobs:
       # builder falls back to it. mingw is still preferred where decorated
       # symbol names matter, and install_mingw.py now has a pinned-asset
       # fallback for the rate-limited release API.
+      # Required on x86: MSVC fails there with "The filename, directory name, or
+      # volume label syntax is incorrect." (32-bit python driving vcvarsall on
+      # 64-bit Windows), so mingw is the only working toolchain for that leg.
+      # Gating this behind the samples input silently broke the whole x86 leg.
       - name: Fetch mingw-w64 for this architecture
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
         run: python scripts/install_mingw.py
 
@@ -121,6 +124,18 @@ jobs:
       - name: Spike 2 on the local mimic target (agent sanity check)
         continue-on-error: true
         run: python spikes/run_spike2.py --local --opts 0 --duration 25
+
+      # Loud failure when the local run never happened. continue-on-error on the
+      # step above plus if-no-files-found: ignore on the upload silently dropped
+      # a whole architecture: the x86 leg lost its mingw toolchain, both the
+      # wl-lic build and the mimic run died in 0.5s, and the run still reported
+      # success with only the x64 artifact.
+      - name: Assert the local run produced a result
+        shell: pwsh
+        run: |
+          $f = "results/spike2_local_win32_${{ matrix.python_arch }}.json"
+          if (-not (Test-Path $f)) { throw "missing $f -- the local agent run did not happen" }
+          Write-Host "local result: $f ($((Get-Item $f).Length) bytes)"
 
       - name: Prepare samples and stub DLLs
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
