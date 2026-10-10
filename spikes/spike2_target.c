@@ -54,7 +54,13 @@ typedef struct {
     unsigned char *dp;
 } mp_int;
 
-static unsigned char g_mp_a[64], g_mp_b[64], g_mp_c[64], g_mp_d[64];
+static unsigned char g_mp_a[64], g_mp_b[64], g_mp_c[64];
+
+/* The RSA output buffer. Stage 2 keys on a 2-byte read of dec_lic + 0x33, so
+ * this has to be a real byte buffer; the mp_int that mp_exptmod writes
+ * through sits at its start, which makes mp_exptmod's destination argument
+ * and dec_lic the same address (that is how the port obtains dec_lic). */
+static unsigned char g_dec_lic[4096];
 
 /* Stands in for libtomcrypt's mp_exptmod. The port only needs its address,
  * but it must be a real direct call for the E8 scan to find it. */
@@ -108,6 +114,36 @@ static void spike_sleep_ms(int ms) {
     Sleep((DWORD)ms);
 #else
     usleep((useconds_t)(ms * 1000));
+#endif
+}
+
+/* Stage 2 looks for exactly 'cmp word ptr [reg1], reg2' (whatlicense's
+ * isWordPtrRegCmp). A plain C comparison does not reliably produce it: GCC at
+ * -O2 folded it to 'cmp $0xbeef,%ax', an immediate, which the port would never
+ * match. Force the memory operand where inline asm is available; MSVC x64 has
+ * no inline asm, so that build keeps the plain comparison as a best effort. */
+static int spike_hash3_equal(volatile unsigned short *p,
+                             unsigned short expected) {
+#if defined(_MSC_VER) && defined(_M_IX86)
+    int result;
+    __asm {
+        mov eax, p
+        mov cx, expected
+        cmp word ptr [eax], cx
+        sete al
+        movzx eax, al
+        mov result, eax
+    }
+    return result;
+#elif defined(__GNUC__)
+    unsigned char equal;
+    __asm__ volatile("cmpw %2, (%1)\n\tsete %0"
+                     : "=q"(equal)
+                     : "r"(p), "r"(expected)
+                     : "cc", "memory");
+    return (int)equal;
+#else
+    return *p == expected;
 #endif
 }
 
@@ -219,7 +255,8 @@ int main(int argc, char **argv) {
      * mp_read_unsigned_bin, called from rsa_exptmod, which then makes the
      * direct call to mp_exptmod. */
     {
-        mp_int g, x, p, y;
+        mp_int g, x, p;
+        mp_int *y = (mp_int *)g_dec_lic;
         int block;
         int blocks;
         /* used = 1 on purpose. The port fingerprints each argument as an
@@ -231,7 +268,7 @@ int main(int argc, char **argv) {
         g.dp = g_mp_a; g.used = 1; g.alloc = 64; g.sign = 0;
         x.dp = g_mp_b; x.used = 1; x.alloc = 64; x.sign = 0;
         p.dp = g_mp_c; p.used = 1; p.alloc = 64; p.sign = 0;
-        y.dp = g_mp_d; y.used = 1; y.alloc = 64; y.sign = 0;
+        y->dp = g_dec_lic; y->used = 1; y->alloc = 4096; y->sign = 0;
         /* The real protection decrypts the license in dec_sections blocks
          * (lic_size / 0x80), so mp_exptmod is called that many times. This
          * matters for the port: it installs its hooks from a deferred
@@ -251,12 +288,33 @@ int main(int argc, char **argv) {
          * completion transition reachable either way. */
         blocks = (int)(size / 0x80) + 2;
         for (block = 0; block < blocks; block++) {
-            rsa_exptmod(&g, &x, &p, &y,
+            rsa_exptmod(&g, &x, &p, y,
                         (const volatile unsigned char *)dst, (int)size);
-            printf("SPIKE2_RSA block=%d used=%d\n", block, y.used);
+            printf("SPIKE2_RSA block=%d used=%d\n", block, y->used);
             fflush(stdout);
             spike_sleep_ms(20);
         }
+    }
+
+    /* Stage 2's target: hash_3 lives at dec_lic + 0x33, is read as a word, and
+     * is then compared with 'cmp word ptr [reg1], reg2'. The value in the
+     * decrypted buffer came out of our own license file, so it will not match
+     * what the program expects -- which is exactly the comparison Stage 2
+     * forces to pass and mines for the real value. */
+    {
+        volatile unsigned short *hash3 =
+            (volatile unsigned short *)(g_dec_lic + 0x33);
+        unsigned short expected = 0xbeef;
+        *hash3 = (unsigned short)(dst[0x33] | ((unsigned)dst[0x34] << 8));
+        printf("SPIKE2_HASH3 ours=0x%04x expected=0x%04x\n",
+               (unsigned)*hash3, (unsigned)expected);
+        fflush(stdout);
+        if (spike_hash3_equal(hash3, expected)) {
+            printf("SPIKE2_HASH3 match\n");
+        } else {
+            printf("SPIKE2_HASH3 mismatch\n");
+        }
+        fflush(stdout);
     }
 
     printf("SPIKE2_DONE size=%lu head=%02x%02x%02x%02x%02x%02x%02x%02x "
