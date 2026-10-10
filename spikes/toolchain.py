@@ -71,7 +71,10 @@ def msvc_arch() -> str:
 
 
 def _run_msvc(command: str, cwd: Path = None):
-    return subprocess.run(["cmd", "/c", command], capture_output=True,
+    # cmd /c needs the entire command wrapped in an extra pair of quotes when
+    # it starts with a quoted path, otherwise it treats the quoted vcvarsall
+    # path itself as the program to run ("...vcvarsall.bat" is not recognized).
+    return subprocess.run(["cmd", "/c", f'"{command}"'], capture_output=True,
                           text=True, cwd=str(cwd) if cwd else None)
 
 

@@ -100,15 +100,19 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     script = session.create_script((SPIKES / "spike2_agent.js").read_text())
     script.on("message", on_message)
     script.load()
-    device.resume(pid)
 
-    # The agent arms its hooks from setup(); the target waits on the go-file.
-    time.sleep(1.5)
+    # Arm the hooks and Stalker BEFORE resuming: a real sample starts doing
+    # file I/O (and may open its license) immediately, so a setup() after
+    # resume() misses everything that happens in the first second -- which is
+    # exactly what the first two CI runs measured (0 file opens observed
+    # while the target was demonstrably running).
     setup = script.exports_sync.setup({
         "headHex": head_hex,
         "ntPath": nt_path,
         "licenseFile": license_file
     })
+    device.resume(pid)
+    # Unblocks the mimic target; harmless for a real sample.
     go_file.write_text("go")
 
     status = None
@@ -200,7 +204,8 @@ def judge_ci(run: dict, head_hex: str) -> dict:
             "ok": redirects >= 1,
             "detail": f"{redirects} regkey.dat open(s) redirected of "
                       f"{opens} file opens seen; original path "
-                      f"{final.get('originalLicensePath')}",
+                      f"{final.get('originalLicensePath')}; opened: "
+                      f"{(final.get('openedPaths') or [])[:5]}",
         },
         "license-mapped": {
             "ok": mapped,
@@ -285,7 +290,12 @@ def ci_pass(args) -> int:
             rows.append({"label": label, "error": "no PE in manifest"})
             continue
         target = None
-        for pe in entry["pes"]:
+        # Prefer a real executable: some archives ship a helper DLL as their
+        # first x64 PE and frida cannot spawn a DLL ("unsupported file
+        # format", as test84's fmodex64.dll did).
+        for pe in sorted(entry["pes"],
+                         key=lambda p: 0 if p["path"].lower().endswith(".exe")
+                         else 1):
             if pe["arch"] == ARCH:
                 target = pe
                 break

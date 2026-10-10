@@ -281,6 +281,13 @@ function installWindowsHooks() {
                 return;
             }
             stats.fileOpens++;
+            /* Record what the target actually opens: with a real sample the
+             * first question is whether it looks for a license file at all,
+             * and under which name. */
+            if (report.openedPaths.length < 80 &&
+                report.openedPaths.indexOf(path) < 0) {
+                report.openedPaths.push(path);
+            }
             if (path.slice(-10).toLowerCase() !== "regkey.dat") {
                 return;
             }
@@ -450,7 +457,8 @@ rpc.exports = {
             arch: Process.arch,
             pointerSize: PTR_SIZE,
             errors: [],
-            licenseFile: options.licenseFile || ""
+            licenseFile: options.licenseFile || "",
+            openedPaths: []
         };
         stats = {
             instructions: 0, inside: 0, outside: 0, byteStoresPlanned: 0,
@@ -511,7 +519,9 @@ rpc.exports = {
             licCopy: plan.licCopy,
             byteWrites: stats.byteWrites,
             byteStoresPlanned: stats.byteStoresPlanned,
-            originalLicensePath: report.originalLicensePath || null
+            originalLicensePath: report.originalLicensePath || null,
+            fileOpens: stats.fileOpens,
+            openedPaths: report.openedPaths.slice(0, 6)
         };
     },
 
