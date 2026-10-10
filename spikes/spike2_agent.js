@@ -814,8 +814,20 @@ function stage1CallCandidate(context, destination) {
 
 /* Candidate "return address back in rsa_exptmod" slots. The PIN original
  * hardcodes [esp+8]; on x64 the frame layout differs, so several slots are
- * collected and the one that actually lies in the main module's code is
- * used (and reported, so the offsets can be pinned down). */
+ * collected and the first one that holds a non-system address is used (and
+ * reported, so the offsets can be pinned down). */
+/* True for Windows' own DLLs. The protection's code lives either in the main
+ * module's image or in memory it allocated for itself (findModuleByAddress
+ * returns null for the latter); neither is a system module. Filtering on the
+ * module *path* rather than on the main module's name keeps both. */
+function stage1IsSystemModule(module) {
+    if (module === null || module === undefined) {
+        return false;
+    }
+    const path = (module.path || "").toLowerCase();
+    return path.indexOf("\\windows\\") !== -1;
+}
+
 function stage1ReturnCandidates(context) {
     const slots = [];
     const sp = context[SP_REG];
@@ -826,8 +838,7 @@ function stage1ReturnCandidates(context) {
             slots.push({
                 offset: offset,
                 value: value.toString(),
-                inModule: module !== null &&
-                    module.name === plan.mainModuleName
+                inModule: !stage1IsSystemModule(module)
             });
         } catch (e) {
             slots.push({ offset: offset, value: "unreadable" });
@@ -995,23 +1006,27 @@ function stage1OnLicensePageAccess(details) {
         return true;
     }
     const pc = ctx[PC_REG];
-    /* Only a read issued from the main module can be the license consumer:
-     * the RSA code (libtomcrypt) is statically linked into it. Reads of the
-     * same page from ntdll/kernelbase are heap bookkeeping, and treating one
-     * of those as the landmark would send sub-stage 2 to a system routine
-     * with no in-module return address (the run before this one showed
-     * exactly that: pc=0x7ffdbb5be70d reading 0x608d60, while drchost's main
-     * module sits at 0x140000000). */
+    /* Skip only reads issued from a Windows system module. Those are heap
+     * bookkeeping on the same page (the previous run showed pc=0x7ffd3ddde6cb
+     * in ntdll.dll reading the license page twice). Everything else counts:
+     * WinLicense's unpacked protection code does not reliably live inside the
+     * main module's image -- it is frequently in memory the protection
+     * allocated for itself, which findModuleByAddress reports as null. Gating
+     * on the main module discarded exactly the read this stage hunts for. */
     const from = Process.findModuleByAddress(pc);
-    if (from === null || from.name !== plan.mainModuleName) {
+    if (stage1IsSystemModule(from)) {
         stage1.collateralReads = (stage1.collateralReads || 0) + 1;
         if (stage1.collateralReads <= 5) {
             stage1Log("sub1-collateral-read", "pc=" + pc + " (" +
-                (from === null ? "?" : from.name) + ") addr=" + address);
+                from.name + ") addr=" + address);
         }
         /* Skip it and keep watching: re-arm once the retry has completed. */
         scheduleRearm();
         return true;
+    }
+    if (stage1.guardHits <= 8) {
+        stage1Log("sub1-landmark-module", "pc=" + pc + " in " +
+            (from === null ? "<private>" : from.name));
     }
     return stage1TakeLandmark(ctx, "op=" + operation + " addr=" + address);
 }
