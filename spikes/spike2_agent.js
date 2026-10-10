@@ -1070,7 +1070,7 @@ function disarmGuard() {
 
 function stage1OnLicensePageAccess(details) {
     const stage1 = plan.stage1;
-    if (!stage1.active || stage1.sub !== 1) {
+    if (!stage1.active) {
         return false;
     }
     const memory = details.memory || null;
@@ -1094,6 +1094,15 @@ function stage1OnLicensePageAccess(details) {
         address.compare(stage1.guardStart) < 0 ||
         address.compare(stage1.guardStart.add(stage1.guardLength)) >= 0) {
         return false;
+    }
+    /* In our guard page. Past sub-stage 1 the guard is supposed to have been
+     * disarmed; if a stale page still faults (the OS clears the guard bit
+     * only on the page that faulted, and the guard spans whole pages), let
+     * the access through instead of returning false, which would hand the
+     * violation to the target's own SEH and kill the process. */
+    if (stage1.sub !== 1) {
+        disarmGuard();
+        return true;
     }
     /* Guard pages are page-granular, so unrelated objects sharing the page
      * fault too. Count them: a runaway count means the guard strategy needs
@@ -1195,6 +1204,14 @@ function stage1CaptureLandmark(context) {
  */
 function stage1TakeLandmark(snapshot, label) {
     const stage1 = plan.stage1;
+    /* Actually clear PAGE_GUARD here, not just the bookkeeping flag. The guard
+     * spans whole pages, and the OS clears the guard bit only on the page
+     * that faulted -- with a 4096-byte license the guard covers two pages, so
+     * the second one is still armed. Once sub-stage 1 is done the handler
+     * returns false for any further violation, which hands it to the target's
+     * SEH and kills the process (run 38043143769: a guard-page read at
+     * lic_copy + 0x1000 immediately after sub3-call-candidates). */
+    disarmGuard();
     const candidates = stage1RankCandidates(snapshot);
     stage1.retCandidates = candidates;
     stage1Log("sub1-lic-page-access", label + " pc=" + snapshot.pc + " " +
