@@ -375,6 +375,20 @@ def judge_ci(run: dict, head_hex: str) -> dict:
 def local_pass(opts, args) -> int:
     rows = []
     ok = True
+    # The local run needs the same RSA key material as the CI run: sub-stage 4
+    # fingerprints each call argument as an mp_int whose digit count is one of
+    # the RSA component lengths, and with rsaKeys unset looksLikeKeyMpInt bails
+    # immediately -- which reads in the report as "no key match" forever.
+    rsa = Path(args.rsa)
+    rsa_keys = None
+    if rsa.exists():
+        rsa_keys = read_rsa_keys(rsa)
+        print(f"local rsa keys: mod1={rsa_keys['mod1Len']}d "
+              f"exp1={rsa_keys['exp1Len']}d mod2={rsa_keys['mod2Len']}d "
+              f"exp2={rsa_keys['exp2Len']}d", flush=True)
+    else:
+        print(f"WARNING: {rsa} missing -- the local run cannot exercise "
+              f"sub-stage 4", flush=True)
     for opt in opts:
         binary = build_target(opt)
         workdir = BUILD / f"local_O{opt}"
@@ -385,7 +399,7 @@ def local_pass(opts, args) -> int:
         print(f"\n=== local {sys.platform}/{ARCH} -O{opt} (head {head_hex}) ===",
               flush=True)
         run = run_agent(binary, workdir, head_hex, windows_nt_path(dummy),
-                        args.duration, str(dummy))
+                        args.duration, str(dummy), rsa_keys)
         verdict = judge_local(run, head_hex)
         run["verdict"] = verdict
         rows.append(run)
