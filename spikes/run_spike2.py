@@ -152,7 +152,23 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
 
     def on_message(message, data):
         if message.get("type") == "send":
-            messages.append(message["payload"])
+            payload = message["payload"]
+            messages.append(payload)
+            # Surface the agent's own stage/Stage-1 log in the CI log as it
+            # happens. The verdict only ever printed the first 12 event names,
+            # so the interesting part of a run that reached sub-stage 5 (the
+            # mp_exptmod address, the per-call arguments, the swap/complete
+            # lines) never left the artifact.
+            if isinstance(payload, dict):
+                spike = payload.get("spike")
+                if spike == "stage1" and \
+                        payload.get("event") != "sub1-collateral-read":
+                    print("    spike2: stage1 " + str(payload.get("event")) +
+                          " " + str(payload.get("detail")), flush=True)
+                elif spike in ("lic_copy", "lic_copy_missing", "lic_mapped",
+                               "byte-store-unresolved", "exit"):
+                    print("    spike2: " + spike + " " +
+                          json.dumps(payload)[:400], flush=True)
         else:
             messages.append({"spike": "message", "raw": message})
 

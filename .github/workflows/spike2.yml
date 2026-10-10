@@ -184,7 +184,7 @@ jobs:
       - name: Spike 2 against real samples (deferred tracing)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --defer-tracing --repeat ${{ inputs.repeat || 1 }} --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 150
+        run: python spikes/run_spike2.py --ci --defer-tracing --repeat ${{ inputs.repeat || 1 }} --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 240
 
       - name: Upload spike 2 results
         if: always()
