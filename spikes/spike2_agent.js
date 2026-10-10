@@ -247,6 +247,37 @@ const WORD_REGISTERS = {
     r12w: "r12", r13w: "r13", r14w: "r14", r15w: "r15"
 };
 
+/* The 64-bit parent of a 16-bit register, for Frida's x64 CpuContext. It
+ * exposes rax/rbx/.../rdx but NOT eax/edx, so mapping dx -> edx (the x86 name)
+ * left context["edx"] undefined and every x64 comparison was rejected as
+ * noReg. */
+const WIDE_REGISTERS = {
+    ax: "rax", cx: "rcx", dx: "rdx", bx: "rbx",
+    sp: "rsp", bp: "rbp", si: "rsi", di: "rdi"
+};
+
+/* The register holding a 16-bit operand's value. Candidates are tried in turn
+ * because which name a CpuContext exposes depends on the architecture. */
+function stage2RegValue(context, regName) {
+    const candidates = [];
+    const parent = WORD_REGISTERS[regName];
+    if (parent !== undefined) {
+        candidates.push(parent);
+    }
+    const wide = WIDE_REGISTERS[regName];
+    if (wide !== undefined) {
+        candidates.push(wide);
+    }
+    candidates.push(regName);
+    for (const name of candidates) {
+        const value = context[name];
+        if (value !== undefined && value !== null) {
+            return { name: name, value: value };
+        }
+    }
+    return null;
+}
+
 function stage2State() {
     if (plan.stage2 === undefined) {
         /* active starts true, not false. Stalker's transform runs once per
@@ -369,6 +400,16 @@ function stage2OnGuardAccess(details) {
     const ctx = details.context || null;
     stage2Log("hash3-read", "pc=" + (ctx === null ? "?" : ctx[PC_REG]) +
         " hits=" + s2.hits);
+    /* Re-read hash_3 now, at the landmark. startStage2 read dec_lic + 0x33
+     * before anything had written it, so it captured 0 and the comparison
+     * could never match "ours" -- the candidate log showed
+     * mem[eax]=0x3730 dx=0xbeef ours=0x0, i.e. both real operands were read
+     * correctly and the reference value was the only thing wrong. */
+    try {
+        s2.hash3 = s2.decLic.add(HASH3_OFFSET).readU16();
+    } catch (e) {
+        /* keep whatever start time captured */
+    }
     s2.sub = 2;
     stage2DisarmGuard();
     /* Deferred, like everything else that is not "read a register": unfollow +
@@ -580,12 +621,12 @@ function stage2ApplyCmp(context, site) {
         return;
     }
     const regName = String(site.regName).trim();
-    const parent = WORD_REGISTERS[regName];
-    if (parent === undefined || context[parent] === undefined) {
+    const found = stage2RegValue(context, regName);
+    if (found === null) {
         s2.applyNoReg = (s2.applyNoReg || 0) + 1;
         return;
     }
-    const regVal = context[parent].and(0xffff).toUInt32();
+    const regVal = found.value.and(0xffff).toUInt32();
 
     s2.cmpCandidates++;
     if (s2.cmpCandidates <= 4) {
