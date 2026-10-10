@@ -336,6 +336,25 @@ function installWindowsHooks() {
                     plan.mapAddress = retval.toString();
                     report.licenseMappedTo = retval.toString();
                     emit({ spike: "lic_mapped", addr: retval.toString() });
+                    if (!plan.tracing) {
+                        /* startTracing is an rpc export; call it through the
+                         * same code path by hand to avoid re-entrancy. */
+                        plan.tracing = true;
+                        followStart = Date.now();
+                        for (const thread of Process.enumerateThreads()) {
+                            try {
+                                Stalker.follow(thread.id,
+                                               { transform: install });
+                                plan.followed.push(thread.id);
+                            } catch (e) {
+                                report.errors.push("follow " + thread.id +
+                                                   ": " + String(e));
+                            }
+                        }
+                        report.followedThreads = plan.followed;
+                        emit({ spike: "tracing_started_at_map",
+                               threads: plan.followed.length });
+                    }
                 }
             }
         }));
@@ -379,6 +398,25 @@ function installLinuxHooks() {
                     plan.mapAddress = retval.toString();
                     report.licenseMappedTo = retval.toString();
                     emit({ spike: "lic_mapped", addr: retval.toString() });
+                    if (!plan.tracing) {
+                        /* startTracing is an rpc export; call it through the
+                         * same code path by hand to avoid re-entrancy. */
+                        plan.tracing = true;
+                        followStart = Date.now();
+                        for (const thread of Process.enumerateThreads()) {
+                            try {
+                                Stalker.follow(thread.id,
+                                               { transform: install });
+                                plan.followed.push(thread.id);
+                            } catch (e) {
+                                report.errors.push("follow " + thread.id +
+                                                   ": " + String(e));
+                            }
+                        }
+                        report.followedThreads = plan.followed;
+                        emit({ spike: "tracing_started_at_map",
+                               threads: plan.followed.length });
+                    }
                 }
             }
         }));
@@ -450,7 +488,8 @@ rpc.exports = {
             moduleBase: null,
             moduleEnd: null,
             hooks: [],
-            followed: []
+            followed: [],
+            tracing: false
         };
         report = {
             platform: Process.platform,
@@ -495,6 +534,20 @@ rpc.exports = {
         }
         report.excludedModules = excluded;
 
+        report.followedThreads = plan.followed;
+        log("stage0 hooks armed (license head " + options.headHex + ")");
+        return report;
+    },
+
+    /* Stalker has to start AFTER the process is resumed: following a thread
+     * that the spawner has stopped does not take effect (the run then traces
+     * nothing at all while the hooks still work). The map hook calls this too
+     * so tracing cannot be missed even if the host's call is late. */
+    startTracing: function () {
+        if (plan.tracing) {
+            return { alreadyStarted: true, threads: plan.followed.length };
+        }
+        plan.tracing = true;
         followStart = Date.now();
         for (const thread of Process.enumerateThreads()) {
             try {
@@ -505,9 +558,8 @@ rpc.exports = {
             }
         }
         report.followedThreads = plan.followed;
-        log("stage0 armed: " + plan.followed.length + " threads followed, " +
-            "license head " + options.headHex);
-        return report;
+        log("tracing started: " + plan.followed.length + " threads followed");
+        return { started: true, threads: plan.followed.length };
     },
 
     status: function () {

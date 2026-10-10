@@ -112,6 +112,9 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         "licenseFile": license_file
     })
     device.resume(pid)
+    # Stalker only takes effect on a running thread.
+    tracing = script.exports_sync.start_tracing()
+    print(f"  tracing: {json.dumps(tracing)}", flush=True)
     # Unblocks the mimic target; harmless for a real sample.
     go_file.write_text("go")
 
