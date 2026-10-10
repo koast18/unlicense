@@ -10,7 +10,7 @@
 #   VPI.DS.Math.dll  x64  WinLicense (.winlice 8.8MB) + FlexLM strings
 #   VPIplayer.exe    x86  Themida (.winlice + .boot, unnamed sections)
 #   bned.exe         x86  FlexNet/FLEXlm vendor daemon (.textidx only)
-bned	samples/dl/bned.exe	flexnet x86 vendor daemon
+bned	samples/dl/bned.exe	flexnet x86 vendor daemon (NOT packed - unlicense rc=2, control only)
 ngahost	samples/dl/NgaHost.exe	winlicense x64 + flexlm
 vpidsmath	samples/dl/VPI.DS.Math.11.1.x64.dll	winlicense x64 dll (runtime dependency)
 drchostvpi	samples/dl/DrcHost.exe	winlicense x64 license-gated (regkey.dat)

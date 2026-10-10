@@ -399,10 +399,14 @@ def judge_ci(run: dict, head_hex: str) -> dict:
     stage1 = final.get("stage1") or {}
     stage1_events = [m.get("event") for m in (run.get("messages") or [])
                      if isinstance(m, dict) and m.get("spike") == "stage1"]
-    landmark = bool(stage1.get("landmark")) or \
-        "sub1-landmark-module" in stage1_events
     hooked = stage1.get("hooked") or \
         sum(1 for e in stage1_events if e == "sub2-hooked")
+    sub = stage1.get("sub") or 0
+    # A landmark is proven by what followed it, not by the event name: the
+    # event is windowed (first few landmarks only), so `hooked`/`sub` are the
+    # authoritative signals.
+    landmark = bool(stage1.get("landmark")) or \
+        "sub1-landmark-module" in stage1_events or hooked > 0 or sub >= 2
     checks["stage1-rsa-chain"] = {
         "ok": stage1.get("complete") is True,
         "detail": f"sub-stage {stage1.get('sub')}, dec_sections="

@@ -1779,7 +1779,13 @@ function stage1OnLicensePageAccess(details) {
         scheduleRearm();
         return true;
     }
-    if (stage1.guardHits <= 8) {
+    stage1.landmarks = (stage1.landmarks || 0) + 1;
+    /* Count landmarks, not guard hits: the guard page is re-armed after every
+     * collateral read, so on a busy run the landmark can be the 9th hit and a
+     * `guardHits <= 8` window silently drops the event -- which is how a run
+     * that reached sub-stage 5 (real mp_exptmod, two calls) still reported
+     * landmark=False. */
+    if (stage1.landmarks <= 8) {
         stage1Log("sub1-landmark-module", "pc=" + pc + " in " +
             (from === null ? "<private>" : from.name));
     }
