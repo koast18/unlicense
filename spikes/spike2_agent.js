@@ -886,6 +886,20 @@ function stage1CallCandidate(context, destination) {
         stage1Log("sub4-found-mp_exptmod", "call target " + destination +
             " matched " + matches + " key-shaped args: " +
             described.join(" | "));
+        /* dec_lic is mp_exptmod's output buffer, i.e. its 4th argument. Read
+         * it from there: the PIN original's [esp+0x8c] frame offset is
+         * x86-only and never matched on x64. */
+        for (const slot of plan.decLicArgSlots) {
+            const value = slotRead(context, slot);
+            if (!value.isNull()) {
+                const fromFrame = report.stage1DecLic;
+                stage1.decLic = value.toString();
+                report.stage1DecLic = stage1.decLic;
+                stage1Log("dec-lic-from-arg", "mp_exptmod destination " +
+                    stage1.decLic + " (frame value was " + fromFrame + ")");
+                break;
+            }
+        }
     } else {
         stage1Log("rsa-call-again", "call#" + stage1.callCount + " at " +
             destination + " " + described.join(" | "));
@@ -1392,6 +1406,16 @@ rpc.exports = {
                 : { kind: "reg", name: "r8" },
             decLicSlot: { kind: "stack", offset: 0x8c },
             decLicCandidates: [0x8c, 0x90, 0x94, 0xa0, 0xb0],
+            /* dec_lic read from mp_exptmod's 4th argument (the output
+             * buffer) rather than from a frame offset inside rsa_exptmod.
+             * The PIN original hardcodes [esp+0x8c], which is x86-only: the
+             * x64 frame is laid out differently and no candidate offset ever
+             * matched there (decLic stayed null). The destination is the
+             * same value either way, and as an argument its location is
+             * defined by the ABI instead of by the compiler's frame. */
+            decLicArgSlots: IS_IA32
+                ? [{ kind: "stack", offset: 0x10 }]
+                : [{ kind: "reg", name: "r9" }],
             keyRefOffset: 0x1c,
             stage1KeySlots: IS_IA32
                 ? [{ kind: "stack", offset: 0x8 },
