@@ -128,6 +128,13 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* Stage 1 needs a read of the license copy: this is the pattern the
+     * read callout must catch (EA == lic_copy). */
+    {
+        volatile uint32_t first_word = ((volatile uint32_t *)dst)[0];
+        (void)first_word;
+    }
+
     printf("SPIKE2_DONE size=%lu head=%02x%02x%02x%02x%02x%02x%02x%02x "
            "copy=%02x%02x%02x%02x%02x%02x%02x%02x\n",
            (unsigned long)size,

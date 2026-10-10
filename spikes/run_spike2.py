@@ -64,6 +64,23 @@ def make_dummy_license(path: Path, size: int = 4096) -> str:
     return head.hex()
 
 
+def read_rsa_keys(path: Path) -> dict:
+    """Parse wl-lic's RSA output: 4 length bytes (in mp_digits) then the four
+    digit arrays. mp_digit is 32-bit on the 32-bit target, so a length of n
+    digits is n*4 bytes."""
+    data = path.read_bytes()
+    lengths = {"mod1": data[0], "exp1": data[1], "mod2": data[2],
+               "exp2": data[3]}
+    offset = 4
+    keys = {}
+    for name, length in lengths.items():
+        chunk = data[offset:offset + length * 4]
+        offset += length * 4
+        keys[name] = chunk.hex()
+        keys[name + "Len"] = length
+    return keys
+
+
 def windows_nt_path(path: Path) -> str:
     absolute = str(path.resolve())
     if not absolute.startswith("\\\\"):
@@ -72,7 +89,8 @@ def windows_nt_path(path: Path) -> str:
 
 
 def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
-              duration: int, license_file: str) -> dict:
+              duration: int, license_file: str,
+              rsa_keys: dict = None) -> dict:
     import frida
 
     workdir.mkdir(parents=True, exist_ok=True)
@@ -106,10 +124,17 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     # resume() misses everything that happens in the first second -- which is
     # exactly what the first two CI runs measured (0 file opens observed
     # while the target was demonstrably running).
+    license_size = 0
+    try:
+        license_size = Path(license_file).stat().st_size
+    except OSError:
+        pass
     setup = script.exports_sync.setup({
         "headHex": head_hex,
         "ntPath": nt_path,
-        "licenseFile": license_file
+        "licenseFile": license_file,
+        "licSize": license_size,
+        "rsaKeys": rsa_keys
     })
     device.resume(pid)
     # Stalker only takes effect on a running thread.
@@ -267,8 +292,22 @@ def judge_ci(run: dict, head_hex: str) -> dict:
             "detail": f"lic_copy={lic_copy}",
         },
     }
+    stage1 = final.get("stage1") or {}
+    stage1_events = [m.get("event") for m in (run.get("messages") or [])
+                     if isinstance(m, dict) and m.get("spike") == "stage1"]
+    checks["stage1-rsa-chain"] = {
+        "ok": stage1.get("complete") is True,
+        "detail": f"sub-stage {stage1.get('sub')}, dec_sections="
+                  f"{stage1.get('decSections')}, mp_exptmod="
+                  f"{stage1.get('mpExptmod')}, calls="
+                  f"{stage1.get('callCount')}, dec_lic="
+                  f"{stage1.get('decLic')}, events="
+                  f"{stage1_events[:12]}",
+    }
     failed = [name for name, row in checks.items() if not row["ok"]]
-    if lic_copy is not None:
+    if stage1.get("complete"):
+        status = "stage1-complete"
+    elif lic_copy is not None:
         status = "stage0-complete"
     elif opens == 0:
         status = "inconclusive"
@@ -315,6 +354,16 @@ def ci_pass(args) -> int:
                          "scripts/prepare_samples.py first)")
     manifest = json.loads(manifest_path.read_text())
     by_label = {entry["label"]: entry for entry in manifest}
+    rsa = Path(args.rsa)
+    if not rsa.exists():
+        print(f"WARNING: {rsa} missing -- Stage 1 cannot swap in real RSA "
+              f"keys", flush=True)
+        rsa_keys = None
+    else:
+        rsa_keys = read_rsa_keys(rsa)
+        print(f"rsa keys: mod1={rsa_keys['mod1Len']}d exp1={rsa_keys['exp1Len']}d "
+              f"mod2={rsa_keys['mod2Len']}d exp2={rsa_keys['exp2Len']}d",
+              flush=True)
     dummy = Path(args.dummy)
     if not dummy.exists():
         # Stage 0 only cares about the license head, so a synthetic dummy
@@ -357,7 +406,7 @@ def ci_pass(args) -> int:
               flush=True)
         try:
             run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
-                            str(dummy))
+                            str(dummy), rsa_keys)
             verdict = judge_ci(run, head_hex)
         except Exception as exc:  # noqa: BLE001
             # One sample refusing to inject must not take the whole leg down
@@ -408,6 +457,7 @@ def main() -> int:
     parser.add_argument("--opts", default="0,2")
     parser.add_argument("--duration", type=int, default=150)
     parser.add_argument("--dummy", default="")
+    parser.add_argument("--rsa", default="results/spike2_dummy/regkey.rsa")
     parser.add_argument("--targets", default="")
     args = parser.parse_args()
 
