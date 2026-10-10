@@ -364,7 +364,12 @@ function stage2OnGuardAccess(details) {
         " hits=" + s2.hits);
     s2.sub = 2;
     stage2DisarmGuard();
-    stage2FollowThreads();
+    /* Deferred, like everything else that is not "read a register": unfollow +
+     * flush + follow across every thread is far too much work to run inside
+     * the exception handler. Doing it inline left the window tracing ~138
+     * instructions, the same class of mistake as calling Thread.backtrace
+     * from the handler in Stage 1. */
+    setTimeout(stage2FollowThreads, 0);
     return true;
 }
 
