@@ -420,7 +420,11 @@ function stage2FollowThreads() {
                 " mem-not-word=" + (s2.scanMemNotWord || 0) +
                 " reg-not-word=" + (s2.scanRegNotWord || 0) +
                 " lastReg=" + (s2.scanLastReg || "-") +
-                " | visited=" + (stats.instructions - s2.instructionsAtFollow) +
+                " | callouts=" + (s2.applyRuns || 0) +
+                " noBase=" + (s2.applyNoBase || 0) +
+                " badRead=" + (s2.applyBadRead || 0) +
+                " noReg=" + (s2.applyNoReg || 0) +
+                " visited=" + (stats.instructions - s2.instructionsAtFollow) +
                 " inside=" + (stats.inside - s2.insideAtFollow) +
                 " outside=" + (stats.outside - s2.outsideAtFollow));
         }
@@ -505,19 +509,27 @@ function stage2ApplyCmp(context, site) {
     if (!s2.active || s2.sub !== 2) {
         return;
     }
+    /* Counted before every other check: "cmp seen" is a compile-time count and
+     * "cmpCandidates" is a post-match count, so without this the log cannot
+     * distinguish "the callout never fired" from "it fired and every operand
+     * check rejected it". */
+    s2.applyRuns = (s2.applyRuns || 0) + 1;
     const base = String(site.memBase).trim();
     if (!Object.prototype.hasOwnProperty.call(context, base)) {
+        s2.applyNoBase = (s2.applyNoBase || 0) + 1;
         return;
     }
     let memVal;
     try {
         memVal = context[base].readU16();
     } catch (e) {
+        s2.applyBadRead = (s2.applyBadRead || 0) + 1;
         return;
     }
     const regName = String(site.regName).trim();
     const parent = WORD_REGISTERS[regName];
     if (parent === undefined || context[parent] === undefined) {
+        s2.applyNoReg = (s2.applyNoReg || 0) + 1;
         return;
     }
     const regVal = context[parent].and(0xffff).toUInt32();
