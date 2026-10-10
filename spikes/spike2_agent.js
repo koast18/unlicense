@@ -298,7 +298,7 @@ function stage2ScheduleRearm() {
             plan.stage2.rearms++;
             stage2ArmGuard();
         }
-    }, 0);
+    }, 2);
 }
 
 function startStage2(decLic) {
@@ -370,13 +370,20 @@ function stage2OnGuardAccess(details) {
 
 function stage2FollowThreads() {
     const s2 = stage2State();
-    /* Drop Stalker's compiled-block cache first. The blocks compiled during
-     * Stage 0 were built by a transform that knew nothing about Stage 2, and
-     * following a thread again reuses cached blocks instead of recompiling
-     * them -- so without this the comparison is never even examined. The tell
-     * was "cmp seen=1" for an entire program: only one freshly compiled block
-     * ever reached the check. */
+    /* Clean re-attach: unfollow first (the threads are still followed from
+     * Stage 0), then flush the compiled-block cache, then follow again.
+     * Following an already-followed thread does not install a new transform,
+     * and a cached block built without the Stage 2 check is never revisited --
+     * together those left the window tracing ~131 instructions and seeing two
+     * cmp instructions in a whole program. */
     try {
+        for (const thread of Process.enumerateThreads()) {
+            try {
+                Stalker.unfollow(thread.id);
+            } catch (e) {
+                /* best effort */
+            }
+        }
         Stalker.flush();
     } catch (e) {
         /* best effort */
