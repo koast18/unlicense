@@ -262,10 +262,18 @@ def report_from_messages(messages: list, status: dict) -> dict:
     Needed whenever the target exits before finish(): the frida script is
     destroyed with the process, so the final RPC is gone, but every
     interesting event was already emitted.
+
+    Stage 1/2 progress is rebuilt here too. Without it a run that took the
+    landmark and reached sub-stage 2 before the target exited reported
+    "sub-stage None" -- the most interesting outcome of the whole session was
+    invisible in the report (ngahost, first real-target landmark).
     """
     report = {"reconstructedFromMessages": True,
               "openedPaths": [], "errors": []}
     candidates = set()
+    stage1_events = []
+    stage2_events = []
+    exits = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -282,12 +290,45 @@ def report_from_messages(messages: list, status: dict) -> dict:
             report["licCopy"] = message.get("addr")
             report["licCopyFirstBytes"] = message.get("bytes")
             report["candidates"] = sorted(candidates)
+        elif kind == "lic_copy_missing":
+            report["licCopyMissing"] = message
+        elif kind == "stage1":
+            stage1_events.append(message)
+        elif kind == "stage2":
+            stage2_events.append(message)
+        elif kind == "exit":
+            exits.append(message)
+    if stage1_events:
+        report["stage1"] = {
+            "reconstructed": True,
+            "events": [m.get("event") for m in stage1_events],
+            "detail": [(m.get("event"), m.get("detail")) for m in stage1_events][-8:],
+            "landmark": any(m.get("event") == "sub1-landmark-module"
+                            for m in stage1_events),
+            "hooked": sum(1 for m in stage1_events
+                          if m.get("event") == "sub2-hooked"),
+        }
+    if stage2_events:
+        report["stage2"] = {
+            "reconstructed": True,
+            "events": [m.get("event") for m in stage2_events][-8:],
+        }
+    if exits:
+        report["exits"] = exits[:4]
     if isinstance(status, dict):
         report["stats"] = {
             "redirects": status.get("redirects", report.get("redirects", 0)),
             "fileOpens": status.get("fileOpens", 0),
             "byteWrites": status.get("byteWrites", 0),
             "byteStoresPlanned": status.get("byteStoresPlanned", 0),
+            "rwNoMap": status.get("rwNoMap", 0),
+            "rwNoTid": status.get("rwNoTid", 0),
+            "rwNoByte": status.get("rwNoByte", 0),
+            "rwByteMismatch": status.get("rwByteMismatch", 0),
+            "byteWritesFromMem": status.get("byteWritesFromMem", 0),
+            "byteStoresSystem": status.get("byteStoresSystem", 0),
+            "instructions": status.get("instructions", 0),
+            "threads": status.get("threads", ""),
             "processGone": status.get("processGone", False)
         }
         if status.get("openedPaths"):
@@ -358,18 +399,27 @@ def judge_ci(run: dict, head_hex: str) -> dict:
     stage1 = final.get("stage1") or {}
     stage1_events = [m.get("event") for m in (run.get("messages") or [])
                      if isinstance(m, dict) and m.get("spike") == "stage1"]
+    landmark = bool(stage1.get("landmark")) or \
+        "sub1-landmark-module" in stage1_events
+    hooked = stage1.get("hooked") or \
+        sum(1 for e in stage1_events if e == "sub2-hooked")
     checks["stage1-rsa-chain"] = {
         "ok": stage1.get("complete") is True,
         "detail": f"sub-stage {stage1.get('sub')}, dec_sections="
                   f"{stage1.get('decSections')}, mp_exptmod="
                   f"{stage1.get('mpExptmod')}, calls="
                   f"{stage1.get('callCount')}, dec_lic="
-                  f"{stage1.get('decLic')}, events="
-                  f"{stage1_events[:12]}",
+                  f"{stage1.get('decLic')}, landmark={landmark}, "
+                  f"sub2-hooked={hooked}, exits={final.get('exits')}, "
+                  f"events={stage1_events[:12]}",
     }
     failed = [name for name, row in checks.items() if not row["ok"]]
     if stage1.get("complete"):
         status = "stage1-complete"
+    elif hooked:
+        status = "stage1-sub2"
+    elif landmark:
+        status = "stage1-landmark"
     elif lic_copy is not None:
         status = "stage0-complete"
     elif opens == 0:
@@ -526,7 +576,9 @@ def ci_pass(args) -> int:
             handle.write("\n".join(summary) + "\n")
 
     completed = [r for r in rows
-                 if r.get("verdict", {}).get("status") == "stage0-complete"]
+                 if r.get("verdict", {}).get("status") in
+                 ("stage0-complete", "stage1-landmark", "stage1-sub2",
+                  "stage1-complete")]
     return 0 if completed else 1
 
 
