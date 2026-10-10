@@ -2,6 +2,11 @@ name: unpack
 
 on:
   workflow_dispatch:
+    inputs:
+      samples_lists:
+        description: "Manifest(s) to prepare, colon separated (tests/*.list)"
+        type: string
+        default: "tests/samples.list"
   push:
     branches: [main, dev]
     paths:
@@ -10,6 +15,9 @@ on:
       - "tests/**"
       - "pyproject.toml"
       - ".github/workflows/unpack.yml"
+
+env:
+  SAMPLES_LISTS: ${{ inputs.samples_lists || 'tests/samples.list' }}
 
 jobs:
   unpack:
@@ -44,6 +52,16 @@ jobs:
 
       - name: Fetch mingw-w64 for this architecture (exports stdcall names verbatim)
         run: python scripts/install_mingw.py
+
+      - name: Fetch the private sample release (crypt set)
+        if: contains(env.SAMPLES_LISTS, 'crypt')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.SAMPLES_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) { throw "SAMPLES_TOKEN secret is not set" }
+          gh release download samples-vpi --repo koast18/wl-samples --dir samples/dl --clobber
+          Get-ChildItem samples/dl | ForEach-Object { Write-Host "$($_.Name) $($_.Length)" }
 
       - name: Prepare samples (download + extract + classify)
         run: python scripts/prepare_samples.py

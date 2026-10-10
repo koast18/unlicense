@@ -1,0 +1,17 @@
+# crypt.zip sample set (VPIphotonics 11.1 / VPIlicenseServer 3.7.1).
+# LABEL<TAB>SOURCE<TAB>NOTES
+# SOURCE is repo-relative: the workflow stages these from the private release
+# koast18/wl-samples (tag samples-vpi) into samples/dl/ with the gh CLI, then
+# every sample directory also gets the sibling DLLs and license.lic.
+#
+# Static classification (local, 2026-10-10):
+#   NgaHost.exe      x64  WinLicense (.winlice 9.0MB) + FlexLM strings
+#   DrcHost.exe      x64  WinLicense (.winlice 8.8MB) + FlexLM strings
+#   VPI.DS.Math.dll  x64  WinLicense (.winlice 8.8MB) + FlexLM strings
+#   VPIplayer.exe    x86  Themida (.winlice + .boot, unnamed sections)
+#   bned.exe         x86  FlexNet/FLEXlm vendor daemon (.textidx only)
+bned	samples/dl/bned.exe	flexnet x86 vendor daemon
+ngahost	samples/dl/NgaHost.exe	winlicense x64 + flexlm
+vpidsmath	samples/dl/VPI.DS.Math.11.1.x64.dll	winlicense x64 dll (runtime dependency)
+drchostvpi	samples/dl/DrcHost.exe	winlicense x64 license-gated (regkey.dat)
+vpiplayer	samples/dl/VPIplayer.exe	themida x86

@@ -14,11 +14,26 @@ on:
         description: "Also run the real samples (known CI dead end, ~12 min of the x86 leg)"
         type: boolean
         default: false
+      samples_lists:
+        description: "Manifest(s) to prepare, colon separated (tests/*.list)"
+        type: string
+        default: "tests/samples.list"
+      targets_x86:
+        description: "Override the x86 target labels (comma separated)"
+        type: string
+        default: ""
+      targets_x64:
+        description: "Override the x64 target labels (comma separated)"
+        type: string
+        default: ""
   push:
     branches: [main, dev]
     paths:
       - "spikes/**"
       - ".github/workflows/spike2.yml"
+
+env:
+  SAMPLES_LISTS: ${{ inputs.samples_lists || 'tests/samples.list' }}
 
 jobs:
   stage0:
@@ -140,7 +155,13 @@ jobs:
       - name: Prepare samples and stub DLLs
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.SAMPLES_TOKEN }}
         run: |
+          if ("${{ env.SAMPLES_LISTS }}".Contains("crypt")) {
+            if (-not $env:GH_TOKEN) { throw "SAMPLES_TOKEN secret is not set" }
+            gh release download samples-vpi --repo koast18/wl-samples --dir samples/dl --clobber
+          }
           python scripts/prepare_samples.py
           python scripts/stub_missing_dlls.py
           python -c "import json;m=json.load(open('results/manifest.json'));print('manifest:',len(m),'entries,',sum(1 for e in m if e['downloaded']),'downloaded')"
@@ -149,7 +170,7 @@ jobs:
       - name: Spike 2 against real samples (Stage 0)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ matrix.targets }} --duration 240
+        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 240
 
       - name: Upload spike 2 results
         if: always()
