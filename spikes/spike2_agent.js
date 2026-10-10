@@ -517,6 +517,11 @@ function stage2ApplyCmp(context, site) {
     const base = String(site.memBase).trim();
     if (!Object.prototype.hasOwnProperty.call(context, base)) {
         s2.applyNoBase = (s2.applyNoBase || 0) + 1;
+        if (s2.applyNoBase <= 3) {
+            stage2Log("cmp-no-base", "pc=" + site.address +
+                " memBase=\"" + base + "\" reg=" + site.regName +
+                " contextKeys=" + Object.keys(context).join(","));
+        }
         return;
     }
     let memVal;
