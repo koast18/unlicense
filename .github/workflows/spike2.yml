@@ -1,0 +1,83 @@
+name: spike2
+
+# Spike 2 — Stage 0 of the whatlicense pipeline (find `lic_copy`) ported to
+# the Frida stack. Runs three things on windows-2022:
+#   1. build wl-lic (dummy license generator) and produce the dummy license
+#   2. the local mimic target (fast sanity check of the agent on this runner)
+#   3. the real samples with the NtCreateFile redirect + MapViewOfFile /
+#      UnmapViewOfFile hooks, i.e. the actual Stage 0 question.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths:
+      - "spikes/**"
+      - ".github/workflows/spike2.yml"
+
+jobs:
+  stage0:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The licence-gated samples are 32-bit; the interpreter width must
+        # match the target (same rule as unlicense's interpreter_can_dump_pe).
+        python_arch: [x86]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: ${{ matrix.python_arch }}
+
+      - name: Exclude workspace from Windows Defender
+        shell: pwsh
+        run: |
+          try { Add-MpPreference -ExclusionPath 'D:\a' -ErrorAction Stop; Write-Host 'exclusion added' }
+          catch { Write-Host "exclusion failed: $_" }
+
+      - name: Install frida
+        run: |
+          python -m pip install --upgrade pip
+          pip install "frida==16.1.3"
+
+      - name: Fetch mingw-w64 for this architecture
+        run: python scripts/install_mingw.py
+
+      # wl-lic is not part of the unlicense fork; it is the whatlicense
+      # author's standalone tool (see references/whatlicense-stage-map.md).
+      - name: Fetch whatlicense (wl-lic sources)
+        run: git clone --depth 1 https://github.com/ret2vibec/whatlicense.git whatlicense
+
+      - name: Build wl-lic and generate the dummy license
+        continue-on-error: true
+        env:
+          WLIC_DIR: ${{ github.workspace }}\whatlicense
+        run: python spikes/build_wl_lic.py
+
+      - name: Spike 2 on the local mimic target (agent sanity check)
+        continue-on-error: true
+        run: python spikes/run_spike2.py --local --opts 0 --duration 25
+
+      - name: Prepare samples and stub DLLs
+        continue-on-error: true
+        run: |
+          python scripts/prepare_samples.py
+          python scripts/stub_missing_dlls.py
+
+      - name: Spike 2 against real samples (Stage 0)
+        continue-on-error: true
+        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets vc_example,whatlic_sample,ragexe --duration 90
+
+      - name: Upload spike 2 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike2-results-${{ matrix.python_arch }}
+          path: |
+            results/
+          if-no-files-found: ignore
+          retention-days: 14
