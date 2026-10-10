@@ -249,8 +249,15 @@ const WORD_REGISTERS = {
 
 function stage2State() {
     if (plan.stage2 === undefined) {
+        /* active starts true, not false. Stalker's transform runs once per
+         * block at compile time, so a block compiled during Stage 0 would
+         * never carry the Stage 2 callout if the gate were false then -- and
+         * no amount of flushing helps, because the block only needs
+         * recompiling if something in it changed. The compile-time gate is
+         * therefore just "stage2 exists"; whether the callout does anything is
+         * decided at run time by sub === 2. */
         plan.stage2 = {
-            active: false, sub: 0, decLic: null, hash3: 0,
+            active: true, sub: 0, decLic: null, hash3: 0,
             guardStart: null, guardLength: 0, hits: 0, rearms: 0,
             rearmPending: false, cmpAddress: null, realHash3: null,
             cmpCandidates: 0, neutralised: 0, followed: [],
@@ -592,14 +599,20 @@ function install(iterator) {
          * (exception handler) and sub-stages 3/4 a static call scan, both of
          * which leave the target running at native speed until it touches
          * what we care about. */
-        /* Stage 2 sub-stage 2 is the exception: it needs the comparison, which
-         * reads a register rather than dec_lic, so it runs only inside the
-         * bounded window Stage 2 opens for itself. */
-        if (plan.stage2 !== undefined && plan.stage2.active &&
-            plan.stage2.sub === 2) {
+        /* Stage 2 sub-stage 2 needs the comparison, which reads a register
+         * rather than dec_lic, so its callout is emitted into every block from
+         * the start and decides at run time whether to do anything. Gating
+         * this at compile time instead was the bug: the comparison's block was
+         * compiled during Stage 0, when Stage 2 was not yet active, so it
+         * carried no callout at all and Stalker.flush() could not repair a
+         * block that had not changed. */
+        if (plan.stage2 !== undefined && plan.stage2.active) {
             const site = stage2RecogniseCmp(insn);
             if (site !== null) {
                 iterator.putCallout(function (context) {
+                    if (plan.stage2.sub !== 2) {
+                        return;
+                    }
                     try {
                         stage2ApplyCmp(context, site);
                     } catch (e) {
@@ -1897,6 +1910,9 @@ rpc.exports = {
         }
         plan.tracing = true;
         followStart = Date.now();
+        /* Materialise plan.stage2 before any block is compiled, so every
+         * block carries the Stage 2 callout from the start. */
+        stage2State();
         for (const thread of Process.enumerateThreads()) {
             try {
                 Stalker.follow(thread.id, { transform: install });
