@@ -134,7 +134,7 @@ def rpc_with_timeout(call, seconds: float = 15.0):
 
 def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
               duration: int, license_file: str,
-              rsa_keys: dict = None) -> dict:
+              rsa_keys: dict = None, defer_tracing: bool = False) -> dict:
     import frida
 
     workdir.mkdir(parents=True, exist_ok=True)
@@ -178,10 +178,13 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         "ntPath": nt_path,
         "licenseFile": license_file,
         "licSize": license_size,
-        "rsaKeys": rsa_keys
+        "rsaKeys": rsa_keys,
+        "deferTracing": defer_tracing
     })
     device.resume(pid)
-    # Stalker only takes effect on a running thread.
+    # Stalker only takes effect on a running thread. With --defer-tracing the
+    # agent refuses this call and starts the trace from the MapViewOfFile hook
+    # instead, so the protection's own unpacking runs at native speed.
     _, tracing = rpc_with_timeout(lambda: script.exports_sync.start_tracing())
     print(f"  tracing: {json.dumps(tracing)}", flush=True)
     # Unblocks the mimic target; harmless for a real sample.
@@ -404,7 +407,8 @@ def local_pass(opts, args) -> int:
         print(f"\n=== local {sys.platform}/{ARCH} -O{opt} (head {head_hex}) ===",
               flush=True)
         run = run_agent(binary, workdir, head_hex, windows_nt_path(dummy),
-                        args.duration, str(dummy), rsa_keys)
+                        args.duration, str(dummy), rsa_keys,
+                        args.defer_tracing)
         verdict = judge_local(run, head_hex)
         run["verdict"] = verdict
         rows.append(run)
@@ -480,7 +484,7 @@ def ci_pass(args) -> int:
               flush=True)
         try:
             run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
-                            str(dummy), rsa_keys)
+                            str(dummy), rsa_keys, args.defer_tracing)
             verdict = judge_ci(run, head_hex)
         except Exception as exc:  # noqa: BLE001
             # One sample refusing to inject must not take the whole leg down
@@ -501,11 +505,13 @@ def ci_pass(args) -> int:
         print(f"  -> {verdict['status']}", flush=True)
 
     RESULTS.mkdir(exist_ok=True)
-    out = RESULTS / f"spike2_ci_{sys.platform}_{ARCH}.json"
+    suffix = "_deferred" if args.defer_tracing else ""
+    out = RESULTS / f"spike2_ci_{sys.platform}_{ARCH}{suffix}.json"
     out.write_text(json.dumps(rows, indent=2))
     print(f"\nwrote {out}", flush=True)
 
-    summary = ["## Spike 2 — Stage 0 (license copy location)", ""]
+    summary = ["## Spike 2 — Stage 0 (license copy location)"
+               + (" (deferred tracing)" if args.defer_tracing else ""), ""]
     for row in rows:
         if row.get("error"):
             summary.append(f"- `{row['label']}`: {row['error']}")
@@ -533,6 +539,10 @@ def main() -> int:
     parser.add_argument("--dummy", default="")
     parser.add_argument("--rsa", default="results/spike2_dummy/regkey.rsa")
     parser.add_argument("--targets", default="")
+    parser.add_argument("--defer-tracing", action="store_true",
+                        help="do not follow threads at startup; let the "
+                             "MapViewOfFile hook start the trace, so the "
+                             "protection's own unpacking runs at native speed")
     args = parser.parse_args()
 
     RESULTS.mkdir(exist_ok=True)

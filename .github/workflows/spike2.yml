@@ -172,6 +172,16 @@ jobs:
         continue-on-error: true
         run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 240
 
+      # Same samples, same agent, but Stalker is not started until the license
+      # file is mapped. Stalker costs ~100x, so with it on from the start the
+      # protection's own unpacking crawls; a frozen byte-store counter on
+      # ngahost/drchostvpi is the symptom. This run says whether the samples
+      # get further when the unpacking is allowed to run at native speed.
+      - name: Spike 2 against real samples (deferred tracing)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
+        continue-on-error: true
+        run: python spikes/run_spike2.py --ci --defer-tracing --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 150
+
       - name: Upload spike 2 results
         if: always()
         uses: actions/upload-artifact@v4

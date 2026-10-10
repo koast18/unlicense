@@ -51,6 +51,18 @@ function log(message) {
     console.log("spike2: " + message);
 }
 
+function threadStates() {
+    /* A frozen byte-store counter can mean "blocked" or "running elsewhere";
+     * the per-thread state separates them. */
+    try {
+        return Process.enumerateThreads().map(function (t) {
+            return t.id + ":" + (t.state || "?");
+        }).join(" ");
+    } catch (e) {
+        return "";
+    }
+}
+
 function emit(payload) {
     try {
         send(payload);
@@ -113,6 +125,18 @@ function writtenByte(info, context) {
         const operand = info.operands[i];
         if (operand.type === "imm") {
             return operand.value & 0xff;
+        }
+        if (operand.type === "mem") {
+            /* A memory-source 1-byte store (movs / a memcpy loop). The byte
+             * that will be written is the byte at the source EA right now, so
+             * read it here -- before the instruction executes. */
+            try {
+                const source = computeEA(operand.value, context, info.next);
+                stats.byteWritesFromMem++;
+                return source.readU8();
+            } catch (e) {
+                return null;
+            }
         }
         if (operand.type === "reg") {
             const entry = BYTE_REGISTERS[operand.value];
@@ -177,28 +201,50 @@ function computeEA(mem, context, nextAddress) {
     return ea;
 }
 
-/* Called for every 1-byte memory store in the main module. */
+/* Called for every 1-byte memory store outside a system module. Every early
+ * return gets its own counter: a single "candidates == 0" cannot tell "the
+ * license was never mapped" from "the source byte could not be resolved" from
+ * "the thread filter rejected it", and those need completely different fixes.
+ * (Same lesson as stage1CallCandidate's silent return, which cost two CI
+ * rounds.) */
 function recordCandidate(info, context) {
     stats.byteWrites++;
     if (!plan.licMapped) {
+        stats.rwNoMap++;
         return;
     }
     let tid = null;
     try {
         tid = Process.getCurrentThreadId();
     } catch (e) {
+        stats.rwNoTid++;
         return;
     }
     if (plan.mainThread !== null && tid !== plan.mainThread) {
+        stats.rwNoTid++;
         return;
     }
     let byte = null;
     try {
         byte = writtenByte(info, context);
     } catch (e) {
+        byte = null;
+    }
+    if (byte === null || byte === undefined) {
+        stats.rwNoByte++;
+        if (stats.rwNoByte <= 5) {
+            emit({
+                spike: "byte-store-unresolved",
+                insn: info.address + " " + info.mnemonic + " " + info.opStr,
+                operands: info.operands.map(function (o) {
+                    return o.type + ":" + o.size;
+                }).join(",")
+            });
+        }
         return;
     }
     if (byte !== plan.head[0]) {
+        stats.rwByteMismatch++;
         return;
     }
     const ea = computeEA(info.mem, context, info.next);
@@ -682,6 +728,40 @@ function stage2ApplyCmp(context, site) {
            decLic: s2.decLic.toString(), cmpSite: site.address });
 }
 
+function isSystemModule(module) {
+    /* Windows system DLLs, and on Linux the C runtime: both run natively so
+     * the trace stays affordable. Everything else -- the main image and the
+     * protector's own allocations alike -- is traced. */
+    const path = (module.path || "").toLowerCase();
+    if (path.indexOf("\\windows\\") !== -1) {
+        return true;
+    }
+    if (path.indexOf("/lib/") !== -1 || path.indexOf("/lib64/") !== -1) {
+        return true;
+    }
+    if (path.indexOf("ld-linux") !== -1 || path.indexOf("libc.so") !== -1) {
+        return true;
+    }
+    return false;
+}
+
+function isSystemAddress(address) {
+    /* "Not a system module", never "the main module": the protection's own
+     * code (and therefore both the license copy and the hash_3 comparison)
+     * frequently runs in memory the protector allocated for itself, which
+     * Process.findModuleByAddress reports as null. Requiring the main module
+     * dropped every byte-store candidate on VPIplayer.exe (0 candidates from
+     * 85k byte stores) while the same gate had already been proven wrong for
+     * Stage 1's landmark. */
+    for (let i = 0; i < plan.systemRanges.length; i++) {
+        const range = plan.systemRanges[i];
+        if (address.compare(range[0]) >= 0 && address.compare(range[1]) < 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function install(iterator) {
     let insn;
     while ((insn = iterator.next()) !== null) {
@@ -690,22 +770,26 @@ function install(iterator) {
         if (address.compare(plan.moduleEnd) >= 0 ||
             address.compare(plan.moduleBase) < 0) {
             stats.outside++;
-            iterator.keep();
-            continue;
+        } else {
+            stats.inside++;
         }
-        stats.inside++;
+        const system = isSystemAddress(address);
         /* 1-byte memory destination = a byte store (or read-modify-write). */
         const first = insn.operands.length > 0 ? insn.operands[0] : null;
         if (first !== null && first.type === "mem" && first.size === 1) {
-            const info = snapshot(insn);
-            stats.byteStoresPlanned++;
-            iterator.putCallout(function (context) {
-                try {
-                    recordCandidate(info, context);
-                } catch (e) {
-                    /* never let a callout kill the trace */
-                }
-            });
+            if (system) {
+                stats.byteStoresSystem++;
+            } else {
+                const info = snapshot(insn);
+                stats.byteStoresPlanned++;
+                iterator.putCallout(function (context) {
+                    try {
+                        recordCandidate(info, context);
+                    } catch (e) {
+                        /* never let a callout kill the trace */
+                    }
+                });
+            }
         }
 
         /* Stage 1 does NOT instrument reads or calls. A callout on every
@@ -723,7 +807,7 @@ function install(iterator) {
          * compiled during Stage 0, when Stage 2 was not yet active, so it
          * carried no callout at all and Stalker.flush() could not repair a
          * block that had not changed. */
-        if (plan.stage2 !== undefined && plan.stage2.active) {
+        if (plan.stage2 !== undefined && plan.stage2.active && !system) {
             const site = stage2RecogniseCmp(insn);
             if (site !== null) {
                 iterator.putCallout(function (context) {
@@ -1930,8 +2014,10 @@ rpc.exports = {
         };
         stats = {
             instructions: 0, inside: 0, outside: 0, byteStoresPlanned: 0,
-            byteWrites: 0, candidates: 0, maps: 0, fileOpens: 0,
-            redirects: 0, elapsedMs: 0, readCalloutsPlanned: 0,
+            byteStoresSystem: 0, byteWrites: 0, candidates: 0, maps: 0,
+            fileOpens: 0, rwNoMap: 0, rwNoTid: 0, rwNoByte: 0,
+            rwByteMismatch: 0, byteWritesFromMem: 0, redirects: 0,
+            elapsedMs: 0, readCalloutsPlanned: 0,
             callCalloutsPlanned: 0, insCalloutsPlanned: 0,
             instrumentationErrors: 0, readCalloutsFired: 0
         };
@@ -1942,6 +2028,29 @@ rpc.exports = {
         plan.moduleEnd = main.base.add(main.size);
         report.mainModule = main.name + " " + main.base;
 
+        /* The gate everywhere is "not a system module", NOT "the main
+         * module". Unpacked protection code usually runs in a private
+         * allocation (findModuleByAddress -> null) or in a DLL next to the
+         * target, and requiring the main module silently discarded exactly
+         * the instructions being hunted: Stage 1's landmark (already fixed)
+         * and Stage 0's license-copy byte stores (VPIplayer.exe: 0
+         * candidates from 85k byte stores). */
+        plan.systemRanges = [];
+        for (const module of modules) {
+            if (isSystemModule(module)) {
+                plan.systemRanges.push([module.base,
+                                        module.base.add(module.size)]);
+            }
+        }
+        report.systemModules = plan.systemRanges.length;
+        /* Materialise plan.stage2 before any block is compiled: Stalker's
+         * transform is compile-time, so a block built before Stage 2 exists
+         * can never carry its callout. */
+        stage2State();
+        if (options.deferTracing) {
+            plan.deferTracing = true;
+        }
+
         if (IS_WINDOWS) {
             installWindowsHooks();
             installDiagnosticHooks();
@@ -1949,11 +2058,12 @@ rpc.exports = {
             installLinuxHooks();
         }
 
-        /* Everything outside the main module runs natively: the protection's
-         * copy loop lives in the protected image. */
+        /* Only system modules run natively. Everything else -- the main
+         * image and the protector's own allocations alike -- has to be
+         * traced, or install() never sees its instructions. */
         let excluded = 0;
         for (const module of modules) {
-            if (module.name === main.name) {
+            if (!isSystemModule(module)) {
                 continue;
             }
             try {
@@ -2025,6 +2135,14 @@ rpc.exports = {
         if (plan.tracing) {
             return { alreadyStarted: true, threads: plan.followed.length };
         }
+        if (plan.deferTracing) {
+            /* Stalker costs ~100x; the protection's own unpacking therefore
+             * crawls while it is on. Deferring the follow until the license is
+             * mapped lets the unpacking run at native speed and engages the
+             * trace exactly where Stage 0 needs it. The MapViewOfFile hook
+             * starts it. */
+            return { deferred: true, threads: 0 };
+        }
         plan.tracing = true;
         followStart = Date.now();
         /* Materialise plan.stage2 before any block is compiled, so every
@@ -2052,6 +2170,16 @@ rpc.exports = {
             licCopy: plan.licCopy,
             byteWrites: stats.byteWrites,
             byteStoresPlanned: stats.byteStoresPlanned,
+            byteStoresSystem: stats.byteStoresSystem,
+            byteWritesFromMem: stats.byteWritesFromMem,
+            rwNoMap: stats.rwNoMap,
+            rwNoTid: stats.rwNoTid,
+            rwNoByte: stats.rwNoByte,
+            rwByteMismatch: stats.rwByteMismatch,
+            instructions: stats.instructions,
+            inside: stats.inside,
+            outside: stats.outside,
+            threads: threadStates(),
             originalLicensePath: report.originalLicensePath || null,
             fileOpens: stats.fileOpens,
             openedPaths: report.openedPaths.slice(0, 6),
