@@ -42,9 +42,16 @@
 #define NOINLINE __attribute__((noinline))
 #endif
 
+/* libtommath's layout, which the port fingerprints (looksLikeKeyMpInt reads
+ * used/alloc/sign as the first three ints and the digit pointer at offset
+ * 12). Getting this wrong makes every argument fail the mp_int shape check,
+ * and sub-stage 4 then returns silently with callCount still 0 -- which is
+ * indistinguishable from "the hook never fired". */
 typedef struct {
-    unsigned char *dp;
     int used;
+    int alloc;
+    int sign;
+    unsigned char *dp;
 } mp_int;
 
 static unsigned char g_mp_a[64], g_mp_b[64], g_mp_c[64], g_mp_d[64];
@@ -214,10 +221,16 @@ int main(int argc, char **argv) {
     {
         mp_int g, x, p, y;
         int block;
-        g.dp = g_mp_a; g.used = 0;
-        x.dp = g_mp_b; x.used = 4;
-        p.dp = g_mp_c; p.used = 4;
-        y.dp = g_mp_d; y.used = 0;
+        /* used = 1 on purpose. The port fingerprints each argument as an
+         * mp_int whose digit count is one of the RSA component lengths from
+         * regkey.rsa -- and both exponents are 1 digit in the wl-lic dummy
+         * keys (exp1Len = exp2Len = 1 on both arches), so 1 always matches
+         * without hardcoding the modulus length, which differs per arch
+         * (mod1Len 74 on x86, 35 on x64). */
+        g.dp = g_mp_a; g.used = 1; g.alloc = 64; g.sign = 0;
+        x.dp = g_mp_b; x.used = 1; x.alloc = 64; x.sign = 0;
+        p.dp = g_mp_c; p.used = 1; p.alloc = 64; p.sign = 0;
+        y.dp = g_mp_d; y.used = 1; y.alloc = 64; y.sign = 0;
         /* The real protection decrypts the license in dec_sections blocks
          * (lic_size / 0x80), so mp_exptmod is called that many times. This
          * matters for the port: it installs its hooks from a deferred

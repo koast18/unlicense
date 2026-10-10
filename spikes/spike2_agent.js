@@ -851,6 +851,15 @@ function stage1CallCandidate(context, destination) {
         }
     }
     if (matches === 0) {
+        /* Say why nothing matched instead of returning silently: with no log
+         * this looked exactly like "the hook never fired" (callCount stayed
+         * 0), which sent two runs chasing the wrong thing. */
+        stage1.noMatchCalls = (stage1.noMatchCalls || 0) + 1;
+        if (stage1.noMatchCalls <= 3) {
+            stage1Log("sub4-no-key-match", "target " + destination +
+                " rsaKeys=" + (plan.rsaKeys === null ? "null" : "set") +
+                " args: " + described.join(" | "));
+        }
         return;
     }
     stage1.callCount++;
