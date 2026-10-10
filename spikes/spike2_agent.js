@@ -707,21 +707,29 @@ function stage1ReadCallout(info, context) {
             " -> ret_to_rsaexptmod=" + stage1.retToRsa + " ([esp+8])");
         /* Waiting for execution to reach that address is done with an
          * Interceptor hook: it fires under Stalker, and an every-instruction
-         * callout would be far too expensive. */
-        try {
-            plan.hooks.push(Interceptor.attach(ret, {
-                onEnter: function () {
-                    try {
-                        stage1BackInRsaExptmod(this.context);
-                    } catch (e) {
-                        stage1Log("sub2-error", String(e));
+         * callout would be far too expensive.
+         *
+         * The attach MUST be deferred: calling Interceptor.attach (or any
+         * other heavy frida API) from inside a Stalker callout deadlocks the
+         * process -- it hung a CI job for 16 minutes. setTimeout runs it on
+         * frida's own JS thread instead. */
+        const retAddress = ret;
+        setTimeout(function () {
+            try {
+                plan.hooks.push(Interceptor.attach(retAddress, {
+                    onEnter: function () {
+                        try {
+                            stage1BackInRsaExptmod(this.context);
+                        } catch (e) {
+                            stage1Log("sub2-error", String(e));
+                        }
                     }
-                }
-            }));
-            stage1Log("sub2-hooked", "waiting for " + stage1.retToRsa);
-        } catch (e) {
-            stage1Log("sub2-hook-failed", String(e));
-        }
+                }));
+                stage1Log("sub2-hooked", "waiting for " + stage1.retToRsa);
+            } catch (e) {
+                stage1Log("sub2-hook-failed", String(e));
+            }
+        }, 0);
         return;
     }
     if (stage1.sub === 3 && stage1.keyRef !== null &&
@@ -747,21 +755,24 @@ function stage1CallCallout(info, context) {
     stage1.sub = 5;
     stage1Log("sub4-found-mp_exptmod", "call at " + info.address +
         " -> " + info.callDest);
-    try {
-        plan.hooks.push(Interceptor.attach(ptr(info.callDest), {
-            onEnter: function () {
-                try {
-                    stage1MpExptmodEnter(this.context);
-                } catch (e) {
-                    stage1Log("mp_exptmod-error", String(e));
+    const destination = ptr(info.callDest);
+    setTimeout(function () {
+        try {
+            plan.hooks.push(Interceptor.attach(destination, {
+                onEnter: function () {
+                    try {
+                        stage1MpExptmodEnter(this.context);
+                    } catch (e) {
+                        stage1Log("mp_exptmod-error", String(e));
+                    }
                 }
-            }
-        }));
-        stage1Log("mp_exptmod-hooked", "Interceptor attached at " +
-            info.callDest);
-    } catch (e) {
-        stage1Log("mp_exptmod-hook-failed", String(e));
-    }
+            }));
+            stage1Log("mp_exptmod-hooked", "Interceptor attached at " +
+                info.callDest);
+        } catch (e) {
+            stage1Log("mp_exptmod-hook-failed", String(e));
+        }
+    }, 0);
 }
 
 /* Sub-stage 2: execution is back inside rsa_exptmod. */

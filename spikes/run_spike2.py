@@ -20,6 +20,7 @@ The acceptance criterion for both is Stage 0's own: find `lic_copy`.
 """
 import argparse
 import json
+import threading
 import os
 import shutil
 import subprocess
@@ -88,6 +89,31 @@ def windows_nt_path(path: Path) -> str:
     return absolute
 
 
+def rpc_with_timeout(call, seconds: float = 15.0):
+    """Run an frida RPC call with a deadline.
+
+    A deadlocked agent (e.g. a frida API called from inside a Stalker callout)
+    makes the RPC block forever, which hung a CI job until its 90 minute
+    timeout. Returns ("timeout", None) instead.
+    """
+    box = {}
+
+    def worker():
+        try:
+            box["value"] = call()
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    if thread.is_alive():
+        return "timeout", None
+    if "error" in box:
+        return "error", box["error"]
+    return "ok", box.get("value")
+
+
 def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
               duration: int, license_file: str,
               rsa_keys: dict = None) -> dict:
@@ -138,7 +164,7 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     })
     device.resume(pid)
     # Stalker only takes effect on a running thread.
-    tracing = script.exports_sync.start_tracing()
+    _, tracing = rpc_with_timeout(lambda: script.exports_sync.start_tracing())
     print(f"  tracing: {json.dumps(tracing)}", flush=True)
     # Unblocks the mimic target; harmless for a real sample.
     go_file.write_text("go")
@@ -148,14 +174,16 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     last_report = 0.0
     while time.time() < deadline:
         time.sleep(2)
-        try:
-            status = script.exports_sync.status()
-        except Exception as exc:  # noqa: BLE001
-            # The agent dies with the process; that is not a harness failure,
-            # it just means the sample exited. Everything already reported
-            # through send() is still in `messages`.
-            status = {"error": str(exc), "processGone": True}
+        outcome, value = rpc_with_timeout(
+            lambda: script.exports_sync.status())
+        if outcome != "ok":
+            # The agent dies with the process (or deadlocks); that is not a
+            # harness failure -- everything already reported through send()
+            # is still in `messages`.
+            status = {"error": str(value), "processGone": True,
+                      "rpcOutcome": outcome}
             break
+        status = value
         if status.get("licCopy"):
             print(f"  stage0 complete: lic_copy={status['licCopy']}",
                   flush=True)
@@ -165,10 +193,12 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
             print(f"  ... {status}", flush=True)
     print(f"  status: {json.dumps(status)}", flush=True)
 
-    try:
-        final = script.exports_sync.finish()
-    except Exception as exc:  # noqa: BLE001
-        final = {"error": f"finish rpc failed: {exc}"}
+    outcome, value = rpc_with_timeout(
+        lambda: script.exports_sync.finish(), 20.0)
+    if outcome == "ok":
+        final = value
+    else:
+        final = {"error": f"finish rpc failed: {value}"}
         final.update(report_from_messages(messages, status))
 
     exit_file.write_text("exit")
