@@ -130,9 +130,8 @@ def run_unlicense(
             if oep_reached.wait(0.5):
                 break
             try:
-                clr_loaded = "clr.dll" in [
-                    name.lower() for name in
-                    process_controller.enumerate_modules()]
+                modules = process_controller.enumerate_modules()
+                clr_loaded = "clr.dll" in [n.lower() for n in modules]
                 if clr_loaded:
                     LOG.info("clr.dll loaded before any OEP event -- "
                              "treating this as a .NET image")
