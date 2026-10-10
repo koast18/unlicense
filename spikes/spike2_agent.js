@@ -396,20 +396,30 @@ function stage2FollowThreads() {
         /* best effort */
     }
     s2.insideAtFollow = stats.inside;
+    s2.instructionsAtFollow = stats.instructions;
+    s2.outsideAtFollow = stats.outside;
     stage2Log("following", "flushed=" + flushed + " threads=" +
         Process.enumerateThreads().length + " (already followed from Stage 0;" +
-        " instructions seen so far " + stats.inside + ")");
+        " instructions=" + stats.instructions + " inside=" + stats.inside +
+        " outside=" + stats.outside + ")");
     /* Bounded window: if the comparison never shows up, say so rather than
      * leaving the target slowed down for the rest of the run. */
     setTimeout(function () {
         if (plan.stage2.sub === 2) {
+            /* Report all three counters. stats.instructions counts every
+             * instruction the transform visits, before the module filter, so
+             * its delta separates "the transform is not running" from "it runs
+             * but everything it sees is outside the main module" -- with only
+             * stats.inside reported those two look identical. */
             stage2Log("cmp-not-found", "no hash_3 comparison in the window; " +
                 "cmp seen=" + (s2.scanCmp || 0) +
                 " no-mem-or-reg=" + (s2.scanNoMemReg || 0) +
                 " mem-not-word=" + (s2.scanMemNotWord || 0) +
                 " reg-not-word=" + (s2.scanRegNotWord || 0) +
                 " lastReg=" + (s2.scanLastReg || "-") +
-                " instructions traced=" + (stats.inside - s2.insideAtFollow));
+                " | visited=" + (stats.instructions - s2.instructionsAtFollow) +
+                " inside=" + (stats.inside - s2.insideAtFollow) +
+                " outside=" + (stats.outside - s2.outsideAtFollow));
         }
     }, 8000);
 }
