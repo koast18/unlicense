@@ -309,19 +309,28 @@ int main(int argc, char **argv) {
     }
 
     /* Stage 2's target: hash_3 lives at dec_lic + 0x33, is read as a word, and
-     * is then compared with 'cmp word ptr [reg1], reg2'. The value in the
-     * decrypted buffer came out of our own license file, so it will not match
-     * what the program expects -- which is exactly the comparison Stage 2
-     * forces to pass and mines for the real value. */
+     * is then compared with 'cmp word ptr [reg1], reg2'.
+     *
+     * The read and the comparison are deliberately separated. Forcing the
+     * memory operand with inline asm makes 'cmp word ptr [dec_lic+0x33], reg'
+     * a single instruction that both reads and compares -- so the guard page
+     * and the comparison land on the same instruction, Stage 2's Stalker
+     * window opens too late, and nothing is ever found. whatlicense notes the
+     * real code reads the value and then shuffles it through push/pop before
+     * comparing, so the comparison must read a copy. */
     {
         volatile unsigned short *hash3 =
             (volatile unsigned short *)(g_dec_lic + 0x33);
+        unsigned short observed = *hash3;
         unsigned short expected = 0xbeef;
         *hash3 = (unsigned short)(dst[0x33] | ((unsigned)dst[0x34] << 8));
+        observed = *hash3;
         printf("SPIKE2_HASH3 ours=0x%04x expected=0x%04x\n",
-               (unsigned)*hash3, (unsigned)expected);
+               (unsigned)observed, (unsigned)expected);
         fflush(stdout);
-        if (spike_hash3_equal(hash3, expected)) {
+        /* Give Stage 2's Stalker window time to open before comparing. */
+        spike_sleep_ms(400);
+        if (spike_hash3_equal(&observed, expected)) {
             printf("SPIKE2_HASH3 match\n");
         } else {
             printf("SPIKE2_HASH3 mismatch\n");

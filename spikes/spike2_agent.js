@@ -344,6 +344,12 @@ function stage2OnGuardAccess(details) {
         return false;
     }
     s2.hits++;
+    if (s2.hits <= 6) {
+        const hctx = details.context || null;
+        stage2Log("guard-hit", "#" + s2.hits + " op=" + operation +
+            " addr=" + address + " pc=" + (hctx === null ? "?" :
+                hctx[PC_REG]) + " hash3At=" + s2.decLic.add(HASH3_OFFSET));
+    }
     if (s2.sub !== 1) {
         stage2DisarmGuard();
         return true;
