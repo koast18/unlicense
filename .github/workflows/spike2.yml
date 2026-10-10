@@ -27,7 +27,12 @@ jobs:
         # upstream probe left as "OEP timeout" (i.e. license-gated) on x64.
         include:
           - python_arch: x86
-            targets: "whatlic_sample,vc_example,ragexe"
+            # vc_example/ragexe are Themida + anti-analysis probes and never
+            # touch regkey.dat, so Stage 1 was only ever exercised on x64.
+            # x86 is the primary target platform, so the x86 leg also runs the
+            # two x86 v3 samples that plausibly are license-gated; the run
+            # report's openedPaths decides which of them actually are.
+            targets: "whatlic_sample,vc_example,ragexe,get1,davethediver72"
           - python_arch: x64
             targets: "drchost,target51,test84"
     runs-on: windows-2022

@@ -850,9 +850,12 @@ function stage1ReturnCandidates(context) {
  * program writing anywhere else in that page would kill the process --
  * which is exactly the 2.7s exit this replaces.
  *
- * The guard is re-armed after every violation that is not the one we are
- * waiting for, so the landmark (first read inside the license buffer) is
- * still caught even when unrelated accesses land in the same page first.
+ * The guard is armed once and never re-armed: the OS clears the guard bit on
+ * the first violation so the faulting instruction retries and completes. Re-
+ * arming inside the handler would make that retry fault again on the same
+ * instruction and spin the thread forever (observed as the status RPC timing
+ * out while the process stayed alive). The first read anywhere in the page is
+ * taken as the landmark instead.
  * ------------------------------------------------------------------- */
 const PAGE_READWRITE = 0x04;
 const PAGE_GUARD = 0x100;
@@ -919,13 +922,29 @@ function stage1OnLicensePageAccess(details) {
         address.compare(stage1.guardStart.add(stage1.guardLength)) >= 0) {
         return false;
     }
-    /* Any access to our page consumed the guard bit. If it is not the read
-     * we are waiting for, re-arm and let it through -- otherwise the next
-     * (interesting) access would go unobserved. */
-    const insideLic = address.compare(stage1.preRsaBuf) >= 0 &&
-        address.compare(stage1.preRsaBuf.add(plan.licSize || 0x100)) < 0;
-    if (operation !== "read" || !insideLic) {
-        armGuard();
+    /* Guard pages are page-granular, so unrelated objects sharing the page
+     * fault too. Count them: a runaway count means the guard strategy needs
+     * rethinking. */
+    stage1.guardHits = (stage1.guardHits || 0) + 1;
+    if (stage1.guardHits <= 8) {
+        stage1Log("guard-hit", "#" + stage1.guardHits + " op=" + operation +
+            " addr=" + address + " lic_copy=" + stage1.preRsaBuf);
+    }
+    /* The first READ anywhere in the guarded page is the landmark.
+     *
+     * Deliberately do NOT re-arm the guard. The OS cleared the guard bit on
+     * this violation, so the faulting instruction retries and completes. If
+     * we re-armed here the retry would fault again on the very same
+     * instruction and the thread would spin inside this handler forever --
+     * observed as the status RPC timing out while the process stayed alive.
+     *
+     * Requiring the address to be inside [lic_copy, lic_copy + lic_size) was
+     * also wrong: that is only the file image, while the program's license
+     * structure spans the whole page (the byte-store candidates land at
+     * 0x608b80, 0x608bb7 and 0x608d30 for a 465-byte license). The first
+     * read in the page is the license consumer we are hunting for.
+     */
+    if (operation !== "read") {
         return true;
     }
     const context = details.context;
@@ -948,9 +967,11 @@ function stage1OnLicensePageAccess(details) {
     });
     if (usable.length === 0) {
         stage1Log("sub1-no-code-return-candidate", "logged candidates above");
-        /* We consumed the guard bit without learning anything: re-arm so the
-         * next access to the license is observed too. */
-        armGuard();
+        /* No stack slot held a code address, so there is nothing to hook.
+         * The page is already unprotected (the guard bit was consumed), so
+         * this run cannot learn more; report it instead of re-arming, which
+         * would spin the thread. */
+        report.stage1NoReturnCandidate = true;
         return true;
     }
     stage1.sub = 2;
@@ -1032,7 +1053,8 @@ rpc.exports = {
                 active: false, sub: 0,
                 preRsaBuf: null, retToRsa: null, decLic: null,
                 keyRef: null, keyRefReads: 0, guardStart: null,
-                guardLength: 0, guardArmed: false, retCandidates: [],
+                guardLength: 0, guardArmed: false, guardHits: 0,
+                retCandidates: [],
                 mpExptmod: null, callCount: 0, decSections: 0,
                 mpInts: null, firstSwapLogged: false, lastCall: null
             },
@@ -1186,6 +1208,8 @@ rpc.exports = {
             fileOpens: stats.fileOpens,
             openedPaths: report.openedPaths.slice(0, 6),
             stage1Sub: plan.stage1.sub,
+            stage1GuardHits: plan.stage1.guardHits,
+            stage1GuardArmed: plan.stage1.guardArmed,
             stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
