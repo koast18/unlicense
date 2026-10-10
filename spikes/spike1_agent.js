@@ -638,6 +638,7 @@ rpc.exports = {
             return report;
         }
         plan.threadId = threadId;
+        plan.followed = [];
         if (options.noStalker === true) {
             /* Control run: same target, same Interceptor, no Stalker. Tells
              * us whether the Interceptor redirection works at all, or
@@ -648,9 +649,20 @@ rpc.exports = {
             log("not following (noStalker control run)");
             return report;
         }
+        /* Follow EVERY thread: WinLicense's verification runs on more than
+         * one, and picking a single thread at setup time is a race (the main
+         * thread is often inside a library call at that instant). */
         followStart = Date.now();
-        Stalker.follow(threadId, { transform: install });
-        report.scan.followed = true;
+        for (const thread of Process.enumerateThreads()) {
+            try {
+                Stalker.follow(thread.id, { transform: install });
+                plan.followed.push(thread.id);
+            } catch (e) {
+                report.errors.push("follow " + thread.id + ": " + String(e));
+            }
+        }
+        report.scan.followed = plan.followed.length > 0;
+        report.scan.followedThreads = plan.followed;
         report.scan.roles = Object.keys(plan.roles).length;
         log("following thread " + threadId + ", roles=" +
             Object.keys(plan.roles).length);
@@ -661,7 +673,9 @@ rpc.exports = {
         stats.elapsedMs = Date.now() - followStart;
         report.stats = stats;
         try {
-            Stalker.unfollow(plan.threadId);
+            for (const id of plan.followed) {
+                Stalker.unfollow(id);
+            }
             Stalker.flush();
             Stalker.garbageCollect();
             report.scan.unfollowed = true;

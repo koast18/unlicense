@@ -29,7 +29,14 @@
 #else
 #  include <unistd.h>
 #  define EXPORT __attribute__((visibility("default")))
-#  define NOINLINE __attribute__((noinline))
+#  if defined(__GNUC__)
+/* noclone matters: at -O2 gcc's interprocedural constant propagation creates
+ * an inlined clone of a function whose result is a constant, and the
+ * original address the spike scans for is then never executed. */
+#    define NOINLINE __attribute__((noinline, noclone))
+#  else
+#    define NOINLINE
+#  endif
 #endif
 
 #define MAGIC_START 0x11223344u

@@ -240,9 +240,12 @@ def judge(final: dict, done: dict, messages: list,
             "ok": g_hits == 8,
             "detail": f"g_hits={g_hits} (want 8)",
         }
-        failed = [n for n, r in checks.items() if not r["ok"]]
+        # In the control run only these two are meaningful; the Stalker-side
+        # answers are reported as information, not as failures.
+        required = ["T-pc-write-interceptor-skips-store", "T-loop-completed"]
+        failed = [n for n in required if not checks.get(n, {}).get("ok")]
         return {"checks": checks, "failed": failed, "ok": not failed,
-                "mode": mode}
+                "mode": mode, "required": required}
 
     checks["T-callouts-dispatched"] = {
         "ok": len(callouts) >= 5,
