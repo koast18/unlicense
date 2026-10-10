@@ -96,8 +96,10 @@ def run_one(pe_rel: str) -> dict:
         for d in dumps:
             shutil.copy(d, out_dir / f"{label}_{d.name}")
         (RESULTS / "logs").mkdir(exist_ok=True)
+        # A generous window: the startup diagnostics we care about (data
+        # directories, .NET detection) sit at the top of a very chatty log.
         (RESULTS / "logs" / f"{label}.log").write_text(
-            "\n".join(log_lines[-400:]))
+            "\n".join(log_lines[-1500:]))
     except Exception as exc:  # noqa: BLE001
         result = {"status": "ERROR", "rc": -1,
                   "seconds": round(time.time() - start, 1),
