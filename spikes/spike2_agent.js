@@ -598,6 +598,17 @@ function stage2ApplyCmp(context, site) {
      * distinguish "the callout never fired" from "it fired and every operand
      * check rejected it". */
     s2.applyRuns = (s2.applyRuns || 0) + 1;
+    /* Refresh the reference value here, not at the guard landmark. The landmark
+     * fires on the read of dec_lic + 0x33, which in the mimic target happens
+     * before that word is written, so it still reads 0; by the time the
+     * comparison executes the word holds the real value. Re-reading is
+     * harmless in the real flow, where the decrypted buffer is already
+     * complete and stable. */
+    try {
+        s2.hash3 = s2.decLic.add(HASH3_OFFSET).readU16();
+    } catch (e) {
+        /* keep the previous value */
+    }
     const base = String(site.memBase).trim();
     /* Existence is tested by indexing, not by hasOwnProperty. Frida's
      * CpuContext is a native object whose register fields are not own
