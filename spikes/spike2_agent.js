@@ -375,19 +375,15 @@ function stage2OnGuardAccess(details) {
 
 function stage2FollowThreads() {
     const s2 = stage2State();
-    /* Only flush. Do NOT unfollow/re-follow here.
+    /* Flush, and do not touch thread follow state here.
      *
-     * The threads are already followed from Stage 0, and this function runs on
-     * the JS thread -- which is the thread that just took the guard violation.
-     * Calling Stalker.unfollow on that thread from inside its own deferred
-     * callback hangs it: the target stopped producing output right after the
-     * hash_3 read (no SPIKE2_HASH3 line, no SPIKE2_DONE) and the run grew from
-     * 26.6s to 37.6s with no report.
-     *
-     * Stalker.flush() invalidates the compiled blocks, which is the part that
-     * actually matters: the transform already carries the Stage 2 branch, but
-     * blocks compiled during Stage 0 were built before it existed and would
-     * never be revisited. */
+     * Both directions hang the target when called from this deferred callback:
+     * unfollow (b22655b) and follow (ca57e0d) each left stdout stopped right
+     * after SPIKE2_RSA block=33 with no SPIKE2_HASH3 line and no window event,
+     * and grew the run from 26.6s to 37.6s. This callback runs on the thread
+     * that just took the guard violation, so Stalker's thread bookkeeping
+     * cannot be touched from it at all. Re-attaching has to happen from the
+     * JS thread, before the read -- see handoff 7.25/7.26. */
     let flushed = false;
     try {
         Stalker.flush();
@@ -395,26 +391,11 @@ function stage2FollowThreads() {
     } catch (e) {
         /* best effort */
     }
-    /* Follow, but never unfollow. The counters settled this: the window was
-     * seeing ~151 instructions in 8s (~19/s), i.e. the transform was barely
-     * running at all -- the threads had already been unfollowed when Stage 0
-     * finished, so flushing a cache that nothing was executing did nothing.
-     * The earlier hang came from Stalker.unfollow being called on the thread
-     * that had just taken the guard violation, not from follow. */
-    let followed = 0;
-    for (const thread of Process.enumerateThreads()) {
-        try {
-            Stalker.follow(thread.id, { transform: install });
-            followed++;
-        } catch (e) {
-            /* best effort */
-        }
-    }
     s2.insideAtFollow = stats.inside;
     s2.instructionsAtFollow = stats.instructions;
     s2.outsideAtFollow = stats.outside;
-    stage2Log("following", "flushed=" + flushed + " followed=" + followed +
-        "/" + Process.enumerateThreads().length + " instructions=" +
+    stage2Log("following", "flushed=" + flushed + " threads=" +
+        Process.enumerateThreads().length + " instructions=" +
         stats.instructions + " inside=" + stats.inside +
         " outside=" + stats.outside);
     /* Bounded window: if the comparison never shows up, say so rather than
