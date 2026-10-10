@@ -530,29 +530,35 @@ def ci_pass(args) -> int:
             continue
         exe = (ROOT / target["path"]).resolve()
         workdir = exe.parent
-        print(f"\n=== {label}: {exe.name} (v{target['version']}) ===",
-              flush=True)
-        try:
-            run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
-                            str(dummy), rsa_keys, args.defer_tracing)
-            verdict = judge_ci(run, head_hex)
-        except Exception as exc:  # noqa: BLE001
-            # One sample refusing to inject must not take the whole leg down
-            # (it did once: ragexe raised ProcessNotRespondingError and no
-            # results were written at all).
-            import traceback
-            print(f"  runner exception: {exc}", flush=True)
-            rows.append({"label": label, "error": str(exc),
-                         "traceback": traceback.format_exc()})
-            continue
-        run["label"] = label
-        run["verdict"] = verdict
-        rows.append(run)
-        print(f"  target: {run['target_stdout'].strip()[:300]}", flush=True)
-        for name, check in verdict["checks"].items():
-            mark = "PASS" if check["ok"] else "FAIL"
-            print(f"  [{mark}] {name}: {check['detail']}", flush=True)
-        print(f"  -> {verdict['status']}", flush=True)
+        # Repeats exist because the single real-target Stage 1 landmark seen so
+        # far did not reproduce: one observation is not a result, and a hit
+        # rate is what says whether the guard/landmark race is real or whether
+        # the one hit was process-teardown noise.
+        for attempt in range(1, args.repeat + 1):
+            tag = label if args.repeat == 1 else f"{label}#{attempt}"
+            print(f"\n=== {tag}: {exe.name} (v{target['version']}) ===",
+                  flush=True)
+            try:
+                run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
+                                str(dummy), rsa_keys, args.defer_tracing)
+                verdict = judge_ci(run, head_hex)
+            except Exception as exc:  # noqa: BLE001
+                # One sample refusing to inject must not take the whole leg
+                # down (it did once: ragexe raised ProcessNotRespondingError
+                # and no results were written at all).
+                import traceback
+                print(f"  runner exception: {exc}", flush=True)
+                rows.append({"label": tag, "error": str(exc),
+                             "traceback": traceback.format_exc()})
+                continue
+            run["label"] = tag
+            run["verdict"] = verdict
+            rows.append(run)
+            print(f"  target: {run['target_stdout'].strip()[:300]}", flush=True)
+            for name, check in verdict["checks"].items():
+                mark = "PASS" if check["ok"] else "FAIL"
+                print(f"  [{mark}] {name}: {check['detail']}", flush=True)
+            print(f"  -> {verdict['status']}", flush=True)
 
     RESULTS.mkdir(exist_ok=True)
     suffix = "_deferred" if args.defer_tracing else ""
@@ -595,6 +601,9 @@ def main() -> int:
                         help="do not follow threads at startup; let the "
                              "MapViewOfFile hook start the trace, so the "
                              "protection's own unpacking runs at native speed")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="run each target N times (a single observation of "
+                             "a flaky landmark is not a result)")
     args = parser.parse_args()
 
     RESULTS.mkdir(exist_ok=True)

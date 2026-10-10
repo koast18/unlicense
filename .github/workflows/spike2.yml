@@ -26,6 +26,10 @@ on:
         description: "Override the x64 target labels (comma separated)"
         type: string
         default: ""
+      repeat:
+        description: "Run each target N times (hit rate for flaky landmarks)"
+        type: string
+        default: "1"
   push:
     branches: [main, dev]
     paths:
@@ -170,7 +174,7 @@ jobs:
       - name: Spike 2 against real samples (Stage 0)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 240
+        run: python spikes/run_spike2.py --ci --repeat ${{ inputs.repeat || 1 }} --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 240
 
       # Same samples, same agent, but Stalker is not started until the license
       # file is mapped. Stalker costs ~100x, so with it on from the start the
@@ -180,7 +184,7 @@ jobs:
       - name: Spike 2 against real samples (deferred tracing)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --defer-tracing --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 150
+        run: python spikes/run_spike2.py --ci --defer-tracing --repeat ${{ inputs.repeat || 1 }} --dummy results/spike2_dummy/regkey.dat --targets ${{ (matrix.python_arch == 'x86' && inputs.targets_x86) || (matrix.python_arch == 'x64' && inputs.targets_x64) || matrix.targets }} --duration 150
 
       - name: Upload spike 2 results
         if: always()
