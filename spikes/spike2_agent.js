@@ -377,7 +377,12 @@ function stage2FollowThreads() {
     setTimeout(function () {
         if (plan.stage2.sub === 2) {
             stage2Unfollow();
-            stage2Log("cmp-not-found", "no hash_3 comparison in the window");
+            stage2Log("cmp-not-found", "no hash_3 comparison in the window; " +
+                "cmp seen=" + (s2.scanCmp || 0) +
+                " no-mem-or-reg=" + (s2.scanNoMemReg || 0) +
+                " mem-not-word=" + (s2.scanMemNotWord || 0) +
+                " reg-not-word=" + (s2.scanRegNotWord || 0) +
+                " lastReg=" + (s2.scanLastReg || "-"));
         }
     }, 8000);
 }
@@ -404,7 +409,14 @@ function stage2Unfollow() {
  * isWordPtrRegCmp -- or null. The Instruction object is only valid inside the
  * transform, so the values are read later from the callout's context. */
 function stage2RecogniseCmp(insn) {
-    if (insn.mnemonic !== "cmp" || insn.operands.length !== 2) {
+    const s2 = plan.stage2;
+    if (insn.mnemonic !== "cmp") {
+        return null;
+    }
+    if (s2 !== undefined) {
+        s2.scanCmp = (s2.scanCmp || 0) + 1;
+    }
+    if (insn.operands.length !== 2) {
         return null;
     }
     let mem = null;
@@ -417,15 +429,34 @@ function stage2RecogniseCmp(insn) {
         }
     }
     if (mem === null || reg === null) {
+        if (s2 !== undefined) {
+            s2.scanNoMemReg = (s2.scanNoMemReg || 0) + 1;
+        }
         return null;
     }
-    if (mem.size !== 2 || reg.size !== 2) {
+    /* Only the memory operand's width is checked. Frida reports a 16-bit
+     * register operand inconsistently -- sometimes as the full 32-bit width
+     * -- so requiring reg.size === 2 rejected genuine matches, and the window
+     * then reported "cmp-not-found" with nothing to explain it. The register
+     * name is the reliable signal. */
+    if (mem.size !== 2) {
+        if (s2 !== undefined) {
+            s2.scanMemNotWord = (s2.scanMemNotWord || 0) + 1;
+        }
+        return null;
+    }
+    const regName = String(reg.value).trim();
+    if (WORD_REGISTERS[regName] === undefined) {
+        if (s2 !== undefined) {
+            s2.scanRegNotWord = (s2.scanRegNotWord || 0) + 1;
+            s2.scanLastReg = regName;
+        }
         return null;
     }
     return {
         address: insn.address.toString(),
         memBase: mem.value,
-        regName: reg.value
+        regName: regName
     };
 }
 

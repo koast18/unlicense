@@ -59,8 +59,13 @@ static unsigned char g_mp_a[64], g_mp_b[64], g_mp_c[64];
 /* The RSA output buffer. Stage 2 keys on a 2-byte read of dec_lic + 0x33, so
  * this has to be a real byte buffer; the mp_int that mp_exptmod writes
  * through sits at its start, which makes mp_exptmod's destination argument
- * and dec_lic the same address (that is how the port obtains dec_lic). */
-static unsigned char g_dec_lic[4096];
+ * and dec_lic the same address (that is how the port obtains dec_lic).
+ *
+ * Heap-allocated on purpose. A static buffer lives in .data, whose page is
+ * full of other globals the program touches constantly: guarding it made
+ * Stage 2's sub-stage 1 hit the re-arm cap (20001 hits) without ever seeing
+ * the hash_3 read. The real dec_lic is an allocation, and its page is quiet. */
+static unsigned char *g_dec_lic;
 
 /* Stands in for libtomcrypt's mp_exptmod. The port only needs its address,
  * but it must be a real direct call for the E8 scan to find it. */
@@ -256,9 +261,16 @@ int main(int argc, char **argv) {
      * direct call to mp_exptmod. */
     {
         mp_int g, x, p;
-        mp_int *y = (mp_int *)g_dec_lic;
+        mp_int *y;
         int block;
         int blocks;
+        g_dec_lic = (unsigned char *)calloc(4096, 1);
+        if (g_dec_lic == NULL) {
+            printf("SPIKE2_FAIL dec_lic alloc\n");
+            fflush(stdout);
+            return 1;
+        }
+        y = (mp_int *)g_dec_lic;
         /* used = 1 on purpose. The port fingerprints each argument as an
          * mp_int whose digit count is one of the RSA component lengths from
          * regkey.rsa -- and both exponents are 1 digit in the wl-lic dummy
