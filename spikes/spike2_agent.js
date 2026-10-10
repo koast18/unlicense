@@ -614,6 +614,7 @@ function stage1MpExptmodEnter(context) {
         slotWrite(context, slots[0], keys.key1.exp.struct);
         slotWrite(context, slots[1], keys.key1.mod.struct);
         stage1Log("swap", "call#" + stage1.callCount + " <- rsa_key_1");
+        disarmGuard();
         stage1.sub = 6;
         report.stage1DecLic = stage1.decLic;
         report.stage1Complete = true;
@@ -802,6 +803,7 @@ function stage1CallCandidate(context, destination) {
         slotWrite(context, slots[0], keys.key1.exp.struct);
         slotWrite(context, slots[1], keys.key1.mod.struct);
         stage1Log("swap", "call#" + stage1.callCount + " <- rsa_key_1");
+        disarmGuard();
         stage1.sub = 6;
         report.stage1DecLic = stage1.decLic;
         report.stage1Complete = true;
@@ -834,20 +836,97 @@ function stage1ReturnCandidates(context) {
     return slots;
 }
 
+/* ---------------------------------------------------------------------
+ * Guard-page plumbing.
+ *
+ * The PIN original sees every read through INS callouts. Frida's closest
+ * equivalent for "tell me when this page is touched" is a real Windows
+ * guard page: PAGE_READWRITE | PAGE_GUARD raises a one-shot
+ * STATUS_GUARD_PAGE_VIOLATION (0x80000001) on the first access and the OS
+ * then clears the guard bit, so the instruction simply retries. That is
+ * *not* the same as Memory.protect(..., "---"): a no-access page raises a
+ * hard ACCESS_VIOLATION (0xC0000005), which the target's own SEH treats as
+ * a crash. The license copy lives on the heap, so the allocator or the
+ * program writing anywhere else in that page would kill the process --
+ * which is exactly the 2.7s exit this replaces.
+ *
+ * The guard is re-armed after every violation that is not the one we are
+ * waiting for, so the landmark (first read inside the license buffer) is
+ * still caught even when unrelated accesses land in the same page first.
+ * ------------------------------------------------------------------- */
+const PAGE_READWRITE = 0x04;
+const PAGE_GUARD = 0x100;
+
+let virtualProtect = null;
+function getVirtualProtect() {
+    if (virtualProtect === null) {
+        const addr = Module.getExportByName("kernel32.dll",
+            "VirtualProtect");
+        virtualProtect = new NativeFunction(addr, "int",
+            ["pointer", "size_t", "uint32", "pointer"]);
+    }
+    return virtualProtect;
+}
+
+function armGuard() {
+    const stage1 = plan.stage1;
+    if (stage1.guardStart === null || stage1.guardLength <= 0) {
+        stage1.guardArmed = false;
+        return false;
+    }
+    const old = Memory.alloc(4);
+    const ok = getVirtualProtect()(stage1.guardStart,
+        stage1.guardLength, PAGE_READWRITE | PAGE_GUARD, old);
+    stage1.guardArmed = ok !== 0;
+    return stage1.guardArmed;
+}
+
+function disarmGuard() {
+    const stage1 = plan.stage1;
+    if (stage1.guardStart === null || stage1.guardLength <= 0) {
+        return;
+    }
+    const old = Memory.alloc(4);
+    getVirtualProtect()(stage1.guardStart, stage1.guardLength,
+        PAGE_READWRITE, old);
+    stage1.guardArmed = false;
+}
+
 function stage1OnLicensePageAccess(details) {
     const stage1 = plan.stage1;
     if (!stage1.active || stage1.sub !== 1) {
         return false;
     }
-    const address = details.memory ? details.memory.address : null;
-    if (address === null ||
-        address.compare(stage1.preRsaBuf) < 0 ||
-        address.compare(stage1.preRsaBuf.add(plan.licSize || 0x100)) >= 0) {
+    const memory = details.memory || null;
+    let address = null;
+    let operation = "read";
+    if (memory !== null) {
+        address = memory.address;
+        operation = memory.operation || "read";
+    }
+    /* A guard-page violation does not always carry the memory descriptor;
+     * the faulting address is still on the exception record. */
+    if ((address === null || address === undefined) &&
+        details.address !== undefined && details.address !== null) {
+        address = details.address;
+    }
+    if (address === null || address === undefined) {
         return false;
     }
-    const operation = details.memory.operation;
-    if (operation === "write") {
+    /* Not our page at all: let the exception go to the target. */
+    if (stage1.guardStart === null ||
+        address.compare(stage1.guardStart) < 0 ||
+        address.compare(stage1.guardStart.add(stage1.guardLength)) >= 0) {
         return false;
+    }
+    /* Any access to our page consumed the guard bit. If it is not the read
+     * we are waiting for, re-arm and let it through -- otherwise the next
+     * (interesting) access would go unobserved. */
+    const insideLic = address.compare(stage1.preRsaBuf) >= 0 &&
+        address.compare(stage1.preRsaBuf.add(plan.licSize || 0x100)) < 0;
+    if (operation !== "read" || !insideLic) {
+        armGuard();
+        return true;
     }
     const context = details.context;
     const candidates = stage1ReturnCandidates(context);
@@ -858,12 +937,9 @@ function stage1OnLicensePageAccess(details) {
             return "[sp+" + candidate.offset.toString(16) + "]=" +
                 candidate.value + (candidate.inModule ? " (code)" : "");
         }).join(" "));
-    /* Let the access through: unguard the page and let the instruction retry. */
-    try {
-        Memory.protect(stage1.guardStart, stage1.guardLength, "rw-");
-    } catch (e) {
-        stage1Log("unguard-failed", String(e));
-    }
+    /* The guard bit is already cleared by the OS, so the instruction will
+     * succeed on retry; no re-protect is needed. */
+    stage1.guardArmed = false;
     /* Hook every stack slot that holds a code address inside the module:
      * the first one to be reached is the return into rsa_exptmod, and
      * logging which slot it was pins the offset down for later runs. */
@@ -872,6 +948,9 @@ function stage1OnLicensePageAccess(details) {
     });
     if (usable.length === 0) {
         stage1Log("sub1-no-code-return-candidate", "logged candidates above");
+        /* We consumed the guard bit without learning anything: re-arm so the
+         * next access to the license is observed too. */
+        armGuard();
         return true;
     }
     stage1.sub = 2;
@@ -924,10 +1003,11 @@ function startStage1(licCopy) {
     stage1.guardStart = start;
     stage1.guardLength = length;
     try {
-        Memory.protect(start, length, "---");
+        armGuard();
         stage1Log("start", "lic_copy=" + licCopy + " lic_size=" +
             plan.licSize + " dec_sections=" + stage1.decSections +
-            " guard=" + start + "+0x" + length.toString(16));
+            " guard=" + start + "+0x" + length.toString(16) +
+            " armed=" + stage1.guardArmed);
     } catch (e) {
         stage1Log("guard-failed", String(e) + " -- falling back to " +
             "unguarded detection");
@@ -952,7 +1032,7 @@ rpc.exports = {
                 active: false, sub: 0,
                 preRsaBuf: null, retToRsa: null, decLic: null,
                 keyRef: null, keyRefReads: 0, guardStart: null,
-            guardLength: 0, retCandidates: [],
+                guardLength: 0, guardArmed: false, retCandidates: [],
                 mpExptmod: null, callCount: 0, decSections: 0,
                 mpInts: null, firstSwapLogged: false, lastCall: null
             },
@@ -965,6 +1045,7 @@ rpc.exports = {
             hooks: [],
             followed: [],
             tracing: false,
+            exceptionsSeen: 0,
             /* x86 reads the RSA arguments off the stack; x64 keeps them in
              * registers (mp_exptmod(G, X, P, Y): X = exponent, P = modulus,
              * i.e. the 2nd and 3rd arguments). */
@@ -1047,6 +1128,18 @@ rpc.exports = {
         plan.mainModuleName = main.name;
         Process.setExceptionHandler(function (details) {
             try {
+                /* Log the first few exceptions so a guard-page violation
+                 * (0x80000001) is distinguishable from a genuine crash
+                 * (0xC0000005) in the run report. */
+                if (plan.exceptionsSeen < 6) {
+                    plan.exceptionsSeen++;
+                    stage1Log("exception", "type=" + details.type +
+                        " addr=" + details.address + " mem=" +
+                        (details.memory
+                            ? (details.memory.operation + "@" +
+                               details.memory.address)
+                            : "none"));
+                }
                 return stage1OnLicensePageAccess(details);
             } catch (e) {
                 stage1Log("exception-handler-error", String(e));
