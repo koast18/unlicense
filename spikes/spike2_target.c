@@ -25,6 +25,77 @@
 #  include <unistd.h>
 #endif
 
+/* ---- RSA-chain mimic --------------------------------------------------
+ * Stage 1's sub-stages 2-5 walk back from the license read: that read is
+ * inside mp_read_unsigned_bin, its caller is rsa_exptmod, and the next
+ * direct call made by rsa_exptmod is mp_exptmod (whatlicense counts reads
+ * of a local key pointer at [ebp+0x1c] to know the call is coming; this
+ * port scans for the E8 instead). Reproducing that shape is what lets the
+ * whole stage be validated without a cooperating real sample -- the real
+ * one (drchost) never reaches its license check inside a CI VM, and the
+ * canonical license-required sample from issue #45 is gone.
+ */
+
+#if defined(_MSC_VER)
+#define NOINLINE __declspec(noinline)
+#else
+#define NOINLINE __attribute__((noinline))
+#endif
+
+typedef struct {
+    unsigned char *dp;
+    int used;
+} mp_int;
+
+static unsigned char g_mp_a[64], g_mp_b[64], g_mp_c[64], g_mp_d[64];
+
+/* Stands in for libtomcrypt's mp_exptmod. The port only needs its address,
+ * but it must be a real direct call for the E8 scan to find it. */
+static NOINLINE int mp_exptmod(mp_int *G, mp_int *X, mp_int *P, mp_int *Y) {
+    int i;
+    int n = X->used < 64 ? X->used : 64;
+    (void)P;
+    for (i = 0; i < n; i++) {
+        Y->dp[i] = (unsigned char)(G->dp[i] ^ X->dp[i]);
+    }
+    Y->used = n;
+    return 0;
+}
+
+/* The read of the encrypted license happens in here, exactly as it does
+ * inside libtomcrypt's mp_read_unsigned_bin. */
+static NOINLINE void mp_read_unsigned_bin(mp_int *a,
+                                          const volatile unsigned char *b,
+                                          int c) {
+    int i;
+    int n = c < 64 ? c : 64;
+    for (i = 0; i < n; i++) {
+        a->dp[i] = b[i];
+    }
+    a->used = n;
+}
+
+/* Reads a local key pointer twice, then makes the direct call to
+ * mp_exptmod -- the shape sub-stages 3 and 4 look for. */
+static volatile int g_rsa_sink;
+
+static NOINLINE int rsa_exptmod(mp_int *G, mp_int *X, mp_int *P, mp_int *Y,
+                                const volatile unsigned char *lic,
+                                int lic_len) {
+    mp_int *key_tmp = X;
+    int seen = key_tmp->used + key_tmp->used;
+    int r;
+    mp_read_unsigned_bin(G, lic, lic_len);
+    r = mp_exptmod(G, key_tmp, P, Y);
+    /* Something has to follow the call. Without it the compiler turns it
+     * into a tail jump (jmp, not e8), and sub-stage 4 -- which looks for the
+     * first direct call in rsa_exptmod -- would find nothing. Verified with
+     * objdump: the call becomes `jmp <mp_exptmod>` at -O2 otherwise. */
+    g_rsa_sink = r;
+    (void)seen;
+    return r;
+}
+
 static void wait_for_file(const char *path) {
     for (int i = 0; i < 900; i++) {
         FILE *f = fopen(path, "rb");
@@ -128,11 +199,20 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    /* Stage 1 needs a read of the license copy: this is the pattern the
-     * read callout must catch (EA == lic_copy). */
+    /* Stage 1 needs a read of the license copy, and it has to happen inside
+     * the RSA chain so sub-stages 2-5 have something to walk: the read is in
+     * mp_read_unsigned_bin, called from rsa_exptmod, which then makes the
+     * direct call to mp_exptmod. */
     {
-        volatile uint32_t first_word = ((volatile uint32_t *)dst)[0];
-        (void)first_word;
+        mp_int g, x, p, y;
+        g.dp = g_mp_a; g.used = 0;
+        x.dp = g_mp_b; x.used = 4;
+        p.dp = g_mp_c; p.used = 4;
+        y.dp = g_mp_d; y.used = 0;
+        rsa_exptmod(&g, &x, &p, &y, (const volatile unsigned char *)dst,
+                    (int)size);
+        printf("SPIKE2_RSA used=%d\n", y.used);
+        fflush(stdout);
     }
 
     printf("SPIKE2_DONE size=%lu head=%02x%02x%02x%02x%02x%02x%02x%02x "
