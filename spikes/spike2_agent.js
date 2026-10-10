@@ -558,12 +558,17 @@ function stage2ApplyCmp(context, site) {
      * check rejected it". */
     s2.applyRuns = (s2.applyRuns || 0) + 1;
     const base = String(site.memBase).trim();
-    if (!Object.prototype.hasOwnProperty.call(context, base)) {
+    /* Existence is tested by indexing, not by hasOwnProperty. Frida's
+     * CpuContext is a native object whose register fields are not own
+     * properties -- Object.keys(context) is empty and hasOwnProperty is false
+     * for every register -- so the hasOwnProperty form rejected a perfectly
+     * good "rax" and reported it as noBase. Indexing is how the rest of the
+     * agent reads registers (context[PC_REG]) and it works. */
+    if (context[base] === undefined || context[base] === null) {
         s2.applyNoBase = (s2.applyNoBase || 0) + 1;
         if (s2.applyNoBase <= 3) {
             stage2Log("cmp-no-base", "pc=" + site.address +
-                " memBase=\"" + base + "\" reg=" + site.regName +
-                " contextKeys=" + Object.keys(context).join(","));
+                " memBase=\"" + base + "\" reg=" + site.regName);
         }
         return;
     }
