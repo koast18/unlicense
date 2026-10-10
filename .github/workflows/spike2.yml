@@ -47,10 +47,37 @@ jobs:
       - name: Fetch mingw-w64 for this architecture
         run: python scripts/install_mingw.py
 
+      # Everything the job needs must exist by the time the real steps run,
+      # so the toolchains are installed/verified here rather than discovered
+      # halfway through. windows-2022 ships Visual Studio; mingw is fetched
+      # by the step above (and is what the stub builder already relies on).
+      - name: Toolchain check
+        shell: pwsh
+        run: |
+          Write-Host "python: $(python -c 'import sys;print(sys.version, sys.maxsize > 2**32)')"
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          Write-Host "visual studio: $vs"
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvarsall.bat"
+          Write-Host "vcvarsall: $vcvars exists=$(Test-Path $vcvars)"
+          Get-ChildItem -Path tools\mingw -Recurse -Filter *-gcc.exe -ErrorAction SilentlyContinue | Select-Object -First 4 FullName | ForEach-Object { Write-Host "mingw gcc: $($_.FullName)" }
+          Get-ChildItem -Path tools\mingw -Recurse -Filter *-g++.exe -ErrorAction SilentlyContinue | Select-Object -First 4 FullName | ForEach-Object { Write-Host "mingw g++: $($_.FullName)" }
+          Write-Host "frida: $(python -c 'import frida;print(frida.__version__)')"
+
       # wl-lic is not part of the unlicense fork; it is the whatlicense
       # author's standalone tool (see references/whatlicense-stage-map.md).
+      # Fetch ladder: git first, codeload tarball as the fallback.
       - name: Fetch whatlicense (wl-lic sources)
-        run: git clone --depth 1 https://github.com/ret2vibec/whatlicense.git whatlicense
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/ret2vibec/whatlicense.git whatlicense
+          if (-not (Test-Path whatlicense\wl-lic\main.cpp)) {
+            Write-Host "clone did not produce wl-lic, trying codeload"
+            curl.exe -sL -o wl.tgz https://codeload.github.com/ret2vibec/whatlicense/tar.gz/refs/heads/main
+            New-Item -ItemType Directory -Force -Path whatlicense | Out-Null
+            tar.exe xzf wl.tgz --strip-components=1 -C whatlicense
+          }
+          if (-not (Test-Path whatlicense\wl-lic\main.cpp)) { throw "wl-lic sources unavailable" }
+          Write-Host "wl-lic sources: $((Get-ChildItem whatlicense\wl-lic\*.cpp).Count) cpp files"
 
       - name: Build wl-lic and generate the dummy license
         continue-on-error: true
