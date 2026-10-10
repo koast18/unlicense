@@ -583,19 +583,23 @@ function stage1Log(event, detail) {
 
 /* libtommath mp_int on the target: { int used; int alloc; int sign; mp_digit *dp; } */
 function buildMpInt(hexDigits, digitCount) {
-    const bytes = [];
-    for (let i = 0; i < digitCount * 4; i += 2) {
-        bytes.push(parseInt(hexDigits.substr(i * 2, 2), 16));
+    /* digitCount 32-bit digits = digitCount * 4 bytes = digitCount * 8 hex
+     * characters. Walk the hex string one byte at a time: the previous loop
+     * advanced the byte index by 2 and then indexed the hex string with it,
+     * which both skipped every other byte and read the wrong pairs, so the
+     * key it swapped in was never the key it claimed to build. */
+    const byteCount = digitCount * 4;
+    const digits = Memory.alloc(byteCount);
+    for (let i = 0; i < byteCount; i++) {
+        digits.add(i).writeU8(parseInt(hexDigits.substr(i * 2, 2), 16));
     }
-    const digits = Memory.alloc(digitCount * 4);
-    for (let i = 0; i < bytes.length; i++) {
-        digits.add(i).writeU8(bytes[i]);
-    }
-    const mp = Memory.alloc(16);
+    /* dp sits at 12 on x86 and 16 on x64 (see mpIntDpOffset), so the struct
+     * needs the extra room or the pointer write runs past the end. */
+    const mp = Memory.alloc(mpIntDpOffset() + Process.pointerSize);
     mp.writeS32(digitCount);          /* used  */
     mp.writeS32(digitCount);          /* alloc */
     mp.writeS32(0);                   /* sign = MP_ZPOS */
-    mp.add(12).writePointer(digits);  /* dp */
+    mp.add(mpIntDpOffset()).writePointer(digits);  /* dp */
     return { struct: mp, digits: digits };
 }
 
@@ -639,6 +643,19 @@ function slotWrite(context, slot, value) {
 
 /* Describe an mp_int the target passed in, so the first run tells us which
  * argument is the exponent and which is the modulus. */
+/* Offset of the digit pointer inside libtommath's mp_int.
+ *
+ *   struct { int used, alloc, sign; mp_digit *dp; }
+ *
+ * On x86 the three ints are 12 bytes and dp follows immediately at 12. On
+ * x64 the pointer needs 8-byte alignment, so four bytes of padding are
+ * inserted and dp lands at 16. Hardcoding 12 (as the first version did)
+ * makes every argument on x64 fail the shape check and read as garbage --
+ * 'access violation accessing 0xffffffffffffffff' while dereferencing dp. */
+function mpIntDpOffset() {
+    return Process.pointerSize === 4 ? 12 : 16;
+}
+
 function describeMpInt(pointer) {
     if (pointer.isNull()) {
         return "null";
@@ -647,7 +664,7 @@ function describeMpInt(pointer) {
         const used = pointer.readS32();
         const alloc = pointer.readS32();
         const sign = pointer.readS32();
-        const dp = pointer.add(12).readPointer();
+        const dp = pointer.add(mpIntDpOffset()).readPointer();
         const digits = [];
         for (let i = 0; i < Math.min(used, 4); i++) {
             digits.push(dp.add(i * 4).readU32().toString(16));
@@ -812,7 +829,7 @@ function looksLikeKeyMpInt(pointer) {
         const used = pointer.readS32();
         const alloc = pointer.readS32();
         const sign = pointer.readS32();
-        const dp = pointer.add(12).readPointer();
+        const dp = pointer.add(mpIntDpOffset()).readPointer();
         if (used <= 0 || alloc < used || sign < 0 || sign > 1 ||
             dp.isNull()) {
             return null;

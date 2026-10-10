@@ -221,6 +221,7 @@ int main(int argc, char **argv) {
     {
         mp_int g, x, p, y;
         int block;
+        int blocks;
         /* used = 1 on purpose. The port fingerprints each argument as an
          * mp_int whose digit count is one of the RSA component lengths from
          * regkey.rsa -- and both exponents are 1 digit in the wl-lic dummy
@@ -237,7 +238,13 @@ int main(int argc, char **argv) {
          * callback, i.e. after the first call has already returned, so a
          * single call is always missed and sub-stage 4 never completes. The
          * pause between blocks gives the agent time to arm. */
-        for (block = 0; block < 32; block++) {
+        /* dec_sections blocks are decrypted with the swapped-in key, and then
+         * the protection verifies the signature with its own key. The port
+         * only completes -- restoring key1 and setting stage1Complete -- on
+         * the call AFTER dec_sections, so the loop must run dec_sections + 1
+         * times or the last state transition is never reached. */
+        blocks = (int)(size / 0x80) + 1;
+        for (block = 0; block < blocks; block++) {
             rsa_exptmod(&g, &x, &p, &y,
                         (const volatile unsigned char *)dst, (int)size);
             printf("SPIKE2_RSA block=%d used=%d\n", block, y.used);
