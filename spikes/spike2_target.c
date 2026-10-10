@@ -96,6 +96,14 @@ static NOINLINE int rsa_exptmod(mp_int *G, mp_int *X, mp_int *P, mp_int *Y,
     return r;
 }
 
+static void spike_sleep_ms(int ms) {
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
+    usleep((useconds_t)(ms * 1000));
+#endif
+}
+
 static void wait_for_file(const char *path) {
     for (int i = 0; i < 900; i++) {
         FILE *f = fopen(path, "rb");
@@ -205,14 +213,24 @@ int main(int argc, char **argv) {
      * direct call to mp_exptmod. */
     {
         mp_int g, x, p, y;
+        int block;
         g.dp = g_mp_a; g.used = 0;
         x.dp = g_mp_b; x.used = 4;
         p.dp = g_mp_c; p.used = 4;
         y.dp = g_mp_d; y.used = 0;
-        rsa_exptmod(&g, &x, &p, &y, (const volatile unsigned char *)dst,
-                    (int)size);
-        printf("SPIKE2_RSA used=%d\n", y.used);
-        fflush(stdout);
+        /* The real protection decrypts the license in dec_sections blocks
+         * (lic_size / 0x80), so mp_exptmod is called that many times. This
+         * matters for the port: it installs its hooks from a deferred
+         * callback, i.e. after the first call has already returned, so a
+         * single call is always missed and sub-stage 4 never completes. The
+         * pause between blocks gives the agent time to arm. */
+        for (block = 0; block < 32; block++) {
+            rsa_exptmod(&g, &x, &p, &y,
+                        (const volatile unsigned char *)dst, (int)size);
+            printf("SPIKE2_RSA block=%d used=%d\n", block, y.used);
+            fflush(stdout);
+            spike_sleep_ms(20);
+        }
     }
 
     printf("SPIKE2_DONE size=%lu head=%02x%02x%02x%02x%02x%02x%02x%02x "
