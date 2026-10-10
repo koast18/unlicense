@@ -170,6 +170,7 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     go_file.write_text("go")
 
     status = None
+    stage0_reported = False
     deadline = time.time() + duration
     last_report = 0.0
     while time.time() < deadline:
@@ -184,9 +185,15 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
                       "rpcOutcome": outcome}
             break
         status = value
-        if status.get("licCopy"):
+        if not stage0_reported and status.get("licCopy"):
+            stage0_reported = True
             print(f"  stage0 complete: lic_copy={status['licCopy']}",
                   flush=True)
+        # Stage 0 finishing is not the end any more: Stage 1 (the RSA chain)
+        # is what this run is for, so keep going until it completes or the
+        # duration runs out.
+        if status.get("stage1Complete") or                 (status.get("stage1Sub") or 0) >= 6:
+            print("  stage1 complete", flush=True)
             break
         if time.time() - last_report >= 15:
             last_report = time.time()

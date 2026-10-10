@@ -243,72 +243,14 @@ function install(iterator) {
             });
         }
 
-        /* Stage 1 instrumentation. It is installed unconditionally and gated
-         * inside the callout: adding it only after Stage 0 finds lic_copy
-         * cannot work, because Stalker has already compiled (and cached) the
-         * blocks that follow, and re-following from inside the hook that
-         * detects lic_copy kills the process. Gating costs one property
-         * compare per callout.
-         *
-         * Every memory read is instrumented, whatever its size: the license
-         * copy is read byte-wise inside mp_read_unsigned_bin, so a
-         * size filter would miss the very read sub-stage 1 waits for. */
-        try {
-        if (insn.mnemonic !== "lea") {
-            let readOperand = null;
-            for (let i = 0; i < insn.operands.length; i++) {
-                const operand = insn.operands[i];
-                if (operand.type !== "mem") {
-                    continue;
-                }
-                /* operands[0] of a plain mov is a pure write */
-                if (i === 0 && insn.mnemonic === "mov") {
-                    continue;
-                }
-                readOperand = i;
-                break;
-            }
-            if (readOperand !== null) {
-                const info = snapshot(insn);
-                info.readIndex = readOperand;
-                stats.readCalloutsPlanned++;
-                iterator.putCallout(function (context) {
-                    try {
-                        if (plan.stage1.active) {
-                            stage1ReadCallout(info, context);
-                        }
-                    } catch (e) { }
-                });
-            }
-        }
-        if (insn.mnemonic === "call") {
-            /* Direct E8 call: read the opcode and the rel32 straight from the
-             * code (the instruction snapshot does not carry raw bytes). */
-            let directCall = null;
-            try {
-                if (Memory.readU8(insn.address) === 0xE8) {
-                    const rel = Memory.readS32(insn.address.add(1));
-                    directCall = insn.address.add(5 + rel).toString();
-                }
-            } catch (e) {
-                directCall = null;
-            }
-            if (directCall !== null) {
-                const info = snapshot(insn);
-                info.callDest = directCall;
-                stats.callCalloutsPlanned++;
-                iterator.putCallout(function (context) {
-                    try {
-                        if (plan.stage1.active && plan.stage1.sub === 4) {
-                            stage1CallCallout(info, context);
-                        }
-                    } catch (e) { }
-                });
-            }
-        }
-        } catch (e) {
-            stats.instrumentationErrors++;
-        }
+        /* Stage 1 does NOT instrument reads or calls. A callout on every
+         * memory read costs ~100x what PIN's native instrumentation costs:
+         * measured 500k callouts fired in a few seconds on drchost, which
+         * slows the protection's own unpacking so much that the RSA path is
+         * minutes away instead of seconds. Sub-stage 1 uses a guard page
+         * (exception handler) and sub-stages 3/4 a static call scan, both of
+         * which leave the target running at native speed until it touches
+         * what we care about. */
         iterator.keep();
     }
 }
@@ -680,115 +622,289 @@ function stage1MpExptmodEnter(context) {
     }
 }
 
-function stage1ReadCallout(info, context) {
+
+/* Fired by a callout on every direct (E8) call while sub-stage 4 is armed. */
+
+/* Sub-stage 2: execution is back inside rsa_exptmod. The destination buffer
+ * for the RSA-decrypted license is an argument of this frame, at a
+ * build-specific offset (the PIN original uses [esp+0x8c]); every candidate
+ * slot is logged so the right one can be pinned down, and the first heap
+ * pointer found is used. */
+function stage1BackInRsaExptmod(context) {
     const stage1 = plan.stage1;
-    if (!stage1.active) {
+    if (!stage1.active || stage1.sub !== 2) {
         return;
     }
-    let ea;
-    try {
-        ea = computeEA(info.mem, context, info.next);
-    } catch (e) {
-        return;
+    const sp = context[SP_REG];
+    const observed = [];
+    let chosen = null;
+    for (const offset of plan.decLicCandidates) {
+        let value = null;
+        let writable = false;
+        let onStack = false;
+        try {
+            value = sp.add(offset).readPointer();
+            const range = Process.findRangeByAddress(value);
+            writable = range !== null && range.protection.indexOf("w") >= 0;
+            onStack = value.compare(sp) >= 0 &&
+                value.compare(sp.add(0x20000)) < 0;
+        } catch (e) {
+            /* unreadable slot */
+        }
+        if (value !== null) {
+            observed.push("[sp+" + offset.toString(16) + "]=" + value +
+                (writable ? " w" : "") + (onStack ? " stack" : ""));
+            if (chosen === null && writable && !onStack) {
+                chosen = value;
+            }
+        }
     }
-    stats.readCalloutsFired++;
-    if (stats.readCalloutsFired <= 5) {
-        stage1Log("read-callout", "#" + stats.readCalloutsFired + " at " +
-            info.address + " ea=" + ea + " (want " + stage1.preRsaBuf + ")");
-    }
-    if (stage1.sub === 1 && ea.equals(stage1.preRsaBuf)) {
-        /* [esp+8] on ia32 = the return address back inside rsa_exptmod */
-        const ret = plan.retSlot.kind === "reg"
-            ? context[plan.retSlot.name]
-            : context[SP_REG].add(plan.retSlot.offset).readPointer();
-        stage1.retToRsa = ret.toString();
-        stage1.sub = 2;
-        stage1Log("sub1-lic-read", "read at " + info.address + " ea=" + ea +
-            " -> ret_to_rsaexptmod=" + stage1.retToRsa + " ([esp+8])");
-        /* Waiting for execution to reach that address is done with an
-         * Interceptor hook: it fires under Stalker, and an every-instruction
-         * callout would be far too expensive.
-         *
-         * The attach MUST be deferred: calling Interceptor.attach (or any
-         * other heavy frida API) from inside a Stalker callout deadlocks the
-         * process -- it hung a CI job for 16 minutes. setTimeout runs it on
-         * frida's own JS thread instead. */
-        const retAddress = ret;
+    stage1.decLic = chosen !== null ? chosen.toString() : null;
+    stage1.sub = 3;
+    stage1Log("sub2-back-in-rsaexptmod", "pc=" + context[PC_REG] +
+        " dec_lic=" + stage1.decLic + " frame: " + observed.join(" "));
+
+    /* Sub-stages 3-5 in one step: scan this function's code for direct calls
+     * and hook each destination; the RSA call is recognised by its arguments
+     * being libtommath mp_ints of the expected digit counts. */
+    const destinations = stage1ScanCalls(ptr(stage1.retToRsa));
+    stage1Log("sub3-call-candidates", destinations.length +
+        " direct calls in the function: " +
+        destinations.slice(0, 12).map(function (address) {
+            return address.toString();
+        }).join(" "));
+    for (const destination of destinations) {
         setTimeout(function () {
             try {
-                plan.hooks.push(Interceptor.attach(retAddress, {
+                plan.hooks.push(Interceptor.attach(destination, {
                     onEnter: function () {
                         try {
+                            stage1CallCandidate(this.context, destination);
+                        } catch (e) {
+                            stage1Log("candidate-error", String(e));
+                        }
+                    }
+                }));
+            } catch (e) {
+                stage1Log("candidate-hook-failed", String(e));
+            }
+        }, 0);
+    }
+}
+
+/* Parse forward from `fromAddress`, collecting the destinations of direct
+ * (E8) calls -- the PIN original takes the next executed call; scanning and
+ * then fingerprinting the arguments is both cheaper and less fragile. */
+function stage1ScanCalls(fromAddress) {
+    const destinations = [];
+    let address = fromAddress;
+    for (let i = 0; i < 4000; i++) {
+        let insn;
+        try {
+            insn = Instruction.parse(address);
+        } catch (e) {
+            break;
+        }
+        if (insn.mnemonic === "ret" || insn.mnemonic === "retf") {
+            break;
+        }
+        if (insn.mnemonic === "call") {
+            try {
+                if (Memory.readU8(address) === 0xE8) {
+                    const rel = Memory.readS32(address.add(1));
+                    destinations.push(address.add(5 + rel));
+                }
+            } catch (e) {
+                /* indirect or unreadable */
+            }
+        }
+        address = insn.next;
+    }
+    return destinations;
+}
+
+/* Does this pointer look like a libtommath mp_int whose digit count matches
+ * one of the RSA key components we are about to swap in? */
+function looksLikeKeyMpInt(pointer) {
+    if (pointer.isNull()) {
+        return null;
+    }
+    const keys = plan.rsaKeys;
+    if (keys === null) {
+        return null;
+    }
+    const expected = [keys.mod1Len, keys.exp1Len, keys.mod2Len, keys.exp2Len];
+    try {
+        const used = pointer.readS32();
+        const alloc = pointer.readS32();
+        const sign = pointer.readS32();
+        const dp = pointer.add(12).readPointer();
+        if (used <= 0 || alloc < used || sign < 0 || sign > 1 ||
+            dp.isNull()) {
+            return null;
+        }
+        if (expected.indexOf(used) < 0) {
+            return null;
+        }
+        /* the digits must be readable */
+        dp.add((used - 1) * 4).readU32();
+        return { used: used, alloc: alloc, sign: sign, dp: dp };
+    } catch (e) {
+        return null;
+    }
+}
+
+/* Called at the entry of every direct call inside rsa_exptmod: the RSA call
+ * is the one whose arguments are the key mp_ints. */
+function stage1CallCandidate(context, destination) {
+    const stage1 = plan.stage1;
+    if (!stage1.active || stage1.sub < 3 || stage1.sub === 6) {
+        return;
+    }
+    const slots = plan.stage1KeySlots;
+    const described = [];
+    let matches = 0;
+    const values = [];
+    for (let i = 0; i < slots.length; i++) {
+        const value = slotRead(context, slots[i]);
+        values.push(value);
+        const shape = looksLikeKeyMpInt(value);
+        described.push("arg" + i + "=" + value + " " +
+            (shape === null ? describeMpInt(value) : "MP_INT" +
+                JSON.stringify(shape.used)));
+        if (shape !== null) {
+            matches++;
+        }
+    }
+    if (matches === 0) {
+        return;
+    }
+    stage1.callCount++;
+    if (stage1.callCount === 1) {
+        stage1.mpExptmod = destination.toString();
+        stage1.sub = 5;
+        stage1Log("sub4-found-mp_exptmod", "call target " + destination +
+            " matched " + matches + " key-shaped args: " +
+            described.join(" | "));
+    } else {
+        stage1Log("rsa-call-again", "call#" + stage1.callCount + " at " +
+            destination + " " + described.join(" | "));
+    }
+    const keys = stage1KeyMaterial();
+    if (keys === null) {
+        return;
+    }
+    if (stage1.callCount <= stage1.decSections) {
+        slotWrite(context, slots[0], keys.key2.exp.struct);
+        slotWrite(context, slots[1], keys.key2.mod.struct);
+        stage1Log("swap", "call#" + stage1.callCount + " <- rsa_key_2");
+    } else {
+        slotWrite(context, slots[0], keys.key1.exp.struct);
+        slotWrite(context, slots[1], keys.key1.mod.struct);
+        stage1Log("swap", "call#" + stage1.callCount + " <- rsa_key_1");
+        stage1.sub = 6;
+        report.stage1DecLic = stage1.decLic;
+        report.stage1Complete = true;
+        stage1Log("complete", "dec_lic=" + stage1.decLic +
+            " (RSA-decrypted license buffer, Stage 2 input)");
+    }
+}
+
+/* Candidate "return address back in rsa_exptmod" slots. The PIN original
+ * hardcodes [esp+8]; on x64 the frame layout differs, so several slots are
+ * collected and the one that actually lies in the main module's code is
+ * used (and reported, so the offsets can be pinned down). */
+function stage1ReturnCandidates(context) {
+    const slots = [];
+    const sp = context[SP_REG];
+    for (const offset of plan.retCandidates) {
+        try {
+            const value = sp.add(offset).readPointer();
+            const module = Process.findModuleByAddress(value);
+            slots.push({
+                offset: offset,
+                value: value.toString(),
+                inModule: module !== null &&
+                    module.name === plan.mainModuleName
+            });
+        } catch (e) {
+            slots.push({ offset: offset, value: "unreadable" });
+        }
+    }
+    return slots;
+}
+
+function stage1OnLicensePageAccess(details) {
+    const stage1 = plan.stage1;
+    if (!stage1.active || stage1.sub !== 1) {
+        return false;
+    }
+    const address = details.memory ? details.memory.address : null;
+    if (address === null ||
+        address.compare(stage1.preRsaBuf) < 0 ||
+        address.compare(stage1.preRsaBuf.add(plan.licSize || 0x100)) >= 0) {
+        return false;
+    }
+    const operation = details.memory.operation;
+    if (operation === "write") {
+        return false;
+    }
+    const context = details.context;
+    const candidates = stage1ReturnCandidates(context);
+    stage1.retCandidates = candidates;
+    stage1Log("sub1-lic-page-access", "op=" + operation + " addr=" +
+        address + " pc=" + context[PC_REG] + " " +
+        candidates.map(function (candidate) {
+            return "[sp+" + candidate.offset.toString(16) + "]=" +
+                candidate.value + (candidate.inModule ? " (code)" : "");
+        }).join(" "));
+    /* Let the access through: unguard the page and let the instruction retry. */
+    try {
+        Memory.protect(stage1.guardStart, stage1.guardLength, "rw-");
+    } catch (e) {
+        stage1Log("unguard-failed", String(e));
+    }
+    /* Hook every stack slot that holds a code address inside the module:
+     * the first one to be reached is the return into rsa_exptmod, and
+     * logging which slot it was pins the offset down for later runs. */
+    const usable = candidates.filter(function (candidate) {
+        return candidate.inModule;
+    });
+    if (usable.length === 0) {
+        stage1Log("sub1-no-code-return-candidate", "logged candidates above");
+        return true;
+    }
+    stage1.sub = 2;
+    stage1.retCandidatesInModule = usable.map(function (candidate) {
+        return candidate.offset.toString(16) + "=" + candidate.value;
+    });
+    for (const candidate of usable) {
+        const address = ptr(candidate.value);
+        const offset = candidate.offset;
+        setTimeout(function () {
+            try {
+                plan.hooks.push(Interceptor.attach(address, {
+                    onEnter: function () {
+                        try {
+                            if (plan.stage1.sub !== 2) {
+                                return;
+                            }
+                            plan.stage1.retSlotOffset = offset;
+                            plan.stage1.retToRsa = address.toString();
                             stage1BackInRsaExptmod(this.context);
                         } catch (e) {
                             stage1Log("sub2-error", String(e));
                         }
                     }
                 }));
-                stage1Log("sub2-hooked", "waiting for " + stage1.retToRsa);
+                stage1Log("sub2-hooked", "candidate [sp+" +
+                    offset.toString(16) + "] = " + address);
             } catch (e) {
-                stage1Log("sub2-hook-failed", String(e));
+                stage1Log("sub2-hook-failed", String(e) + " for " + address);
             }
         }, 0);
-        return;
     }
-    if (stage1.sub === 3 && stage1.keyRef !== null &&
-        ea.equals(stage1.keyRef)) {
-        stage1.keyRefReads++;
-        stage1Log("sub3-keyref-read", "#" + stage1.keyRefReads + " at " +
-            info.address + " ea=" + ea);
-        if (stage1.keyRefReads >= 2) {
-            stage1.sub = 4;
-            stage1Log("sub4-armed", "next E8 call is mp_exptmod");
-        }
-    }
-}
-
-/* Fired by a callout on every direct (E8) call while sub-stage 4 is armed. */
-function stage1CallCallout(info, context) {
-    const stage1 = plan.stage1;
-    if (!stage1.active || stage1.sub !== 4) {
-        return;
-    }
-    stage1.mpExptmod = info.callDest;
-    stage1.lastCall = info.address + " -> " + info.callDest;
-    stage1.sub = 5;
-    stage1Log("sub4-found-mp_exptmod", "call at " + info.address +
-        " -> " + info.callDest);
-    const destination = ptr(info.callDest);
-    setTimeout(function () {
-        try {
-            plan.hooks.push(Interceptor.attach(destination, {
-                onEnter: function () {
-                    try {
-                        stage1MpExptmodEnter(this.context);
-                    } catch (e) {
-                        stage1Log("mp_exptmod-error", String(e));
-                    }
-                }
-            }));
-            stage1Log("mp_exptmod-hooked", "Interceptor attached at " +
-                info.callDest);
-        } catch (e) {
-            stage1Log("mp_exptmod-hook-failed", String(e));
-        }
-    }, 0);
-}
-
-/* Sub-stage 2: execution is back inside rsa_exptmod. */
-function stage1BackInRsaExptmod(context) {
-    const stage1 = plan.stage1;
-    if (!stage1.active || stage1.sub !== 2) {
-        return;
-    }
-    stage1.decLic = context[SP_REG].add(plan.decLicSlot.offset)
-        .readPointer().toString();
-    stage1.keyRef = context[BP_REG].add(plan.keyRefOffset);
-    stage1.sub = 3;
-    stage1Log("sub2-back-in-rsaexptmod", "dec_lic=" + stage1.decLic +
-        " ([esp+" + plan.decLicSlot.offset.toString(16) +
-        "]) key_tmp_ref=" + stage1.keyRef + " (ebp+" +
-        plan.keyRefOffset.toString(16) + ")");
+    return true;
 }
 
 function startStage1(licCopy) {
@@ -797,8 +913,25 @@ function startStage1(licCopy) {
     stage1.sub = 1;
     stage1.preRsaBuf = ptr(licCopy);
     stage1.decSections = Math.floor(plan.licSize / 0x80);
-    stage1Log("start", "lic_copy=" + licCopy + " lic_size=" + plan.licSize +
-        " dec_sections=" + stage1.decSections);
+    /* Guard the page holding the license copy: the first read of it is
+     * sub-stage 1's landmark, and a guard page costs nothing until it is
+     * touched. */
+    const pageSize = Process.pageSize;
+    const start = ptr(licCopy).and(ptr(pageSize - 1).not());
+    const span = Math.max(plan.licSize || 0x100, 1);
+    const length = Math.ceil((ptr(licCopy).sub(start).toUInt32() + span) /
+        pageSize) * pageSize;
+    stage1.guardStart = start;
+    stage1.guardLength = length;
+    try {
+        Memory.protect(start, length, "---");
+        stage1Log("start", "lic_copy=" + licCopy + " lic_size=" +
+            plan.licSize + " dec_sections=" + stage1.decSections +
+            " guard=" + start + "+0x" + length.toString(16));
+    } catch (e) {
+        stage1Log("guard-failed", String(e) + " -- falling back to " +
+            "unguarded detection");
+    }
 }
 
 rpc.exports = {
@@ -818,7 +951,8 @@ rpc.exports = {
             stage1: {
                 active: false, sub: 0,
                 preRsaBuf: null, retToRsa: null, decLic: null,
-                keyRef: null, keyRefReads: 0,
+                keyRef: null, keyRefReads: 0, guardStart: null,
+            guardLength: 0, retCandidates: [],
                 mpExptmod: null, callCount: 0, decSections: 0,
                 mpInts: null, firstSwapLogged: false, lastCall: null
             },
@@ -837,6 +971,7 @@ rpc.exports = {
             retSlot: IS_IA32 ? { kind: "stack", offset: 0x8 }
                 : { kind: "reg", name: "r8" },
             decLicSlot: { kind: "stack", offset: 0x8c },
+            decLicCandidates: [0x8c, 0x90, 0x94, 0xa0, 0xb0],
             keyRefOffset: 0x1c,
             stage1KeySlots: IS_IA32
                 ? [{ kind: "stack", offset: 0x8 },
@@ -898,6 +1033,26 @@ rpc.exports = {
         if (options.stage1KeySlots) {
             plan.stage1KeySlots = options.stage1KeySlots;
         }
+        if (options.retCandidates) {
+            plan.retCandidates = options.retCandidates;
+        }
+        if (options.decLicCandidates) {
+            plan.decLicCandidates = options.decLicCandidates;
+        }
+        /* Candidate stack slots for the return address back into
+         * rsa_exptmod: the PIN original uses [esp+8]. */
+        plan.retCandidates = options.retCandidates ||
+            (IS_IA32 ? [0x0, 0x4, 0x8, 0xc, 0x10, 0x14, 0x18]
+                     : [0x0, 0x8, 0x10, 0x18, 0x20, 0x28]);
+        plan.mainModuleName = main.name;
+        Process.setExceptionHandler(function (details) {
+            try {
+                return stage1OnLicensePageAccess(details);
+            } catch (e) {
+                stage1Log("exception-handler-error", String(e));
+                return false;
+            }
+        });
         log("stage0 hooks armed (license head " + options.headHex + ")");
         return report;
     },
@@ -938,9 +1093,11 @@ rpc.exports = {
             fileOpens: stats.fileOpens,
             openedPaths: report.openedPaths.slice(0, 6),
             stage1Sub: plan.stage1.sub,
+            stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
-            stage1Calls: plan.stage1.callCount
+            stage1Calls: plan.stage1.callCount,
+            retToRsa: plan.stage1.retToRsa
         };
     },
 
@@ -972,6 +1129,8 @@ rpc.exports = {
                 ? plan.stage1.preRsaBuf.toString() : null,
             retToRsa: plan.stage1.retToRsa,
             decLic: plan.stage1.decLic,
+            retSlotOffset: plan.stage1.retSlotOffset,
+            retCandidatesInModule: plan.stage1.retCandidatesInModule,
             keyRef: plan.stage1.keyRef ? plan.stage1.keyRef.toString() : null,
             keyRefReads: plan.stage1.keyRefReads,
             mpExptmod: plan.stage1.mpExptmod,

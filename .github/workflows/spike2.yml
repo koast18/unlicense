@@ -119,7 +119,7 @@ jobs:
 
       - name: Spike 2 against real samples (Stage 0)
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ matrix.targets }} --duration 150
+        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ matrix.targets }} --duration 240
 
       - name: Upload spike 2 results
         if: always()
