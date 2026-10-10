@@ -119,10 +119,47 @@ def run_unlicense(
     process_controller = frida_exec.spawn_and_instrument(
         pe_path, text_section_ranges, notify_oep_reached)
     try:
-        # Block until OEP is reached
-        if not oep_reached.wait(float(timeout)):
+        # Wait for the OEP event *or* for clr.dll to show up, whichever comes
+        # first. Static detection is not enough: WinLicense zeroes the COM
+        # descriptor directory of the on-disk image and loads the CLR itself
+        # at runtime, so unpack109/WPFLauncher look like plain PEs until they
+        # are running (and their native OEP never fires at all).
+        deadline = time.time() + float(timeout)
+        clr_loaded = False
+        while time.time() < deadline:
+            if oep_reached.wait(0.5):
+                break
+            try:
+                clr_loaded = "clr.dll" in [
+                    name.lower() for name in
+                    process_controller.enumerate_modules()]
+                if clr_loaded:
+                    LOG.info("clr.dll loaded before any OEP event -- "
+                             "treating this as a .NET image")
+                    is_dotnet = True
+                    break
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("module enumeration failed: %s", exc)
+        if not oep_reached.is_set() and not clr_loaded:
             LOG.error("Original entry point wasn't reached before timeout")
             sys.exit(4)
+
+        if clr_loaded:
+            # Let the runtime finish decrypting before dumping.
+            time.sleep(DOTNET_SETTLE_SECONDS)
+            main_ranges = process_controller.main_module_ranges
+            if not main_ranges:
+                LOG.error("Failed to read the image base of the process")
+                sys.exit(4)
+            LOG.info("Dumping .NET assembly (base=%s)",
+                     hex(main_ranges[0].base))
+            if not dump_dotnet_assembly(process_controller,
+                                        main_ranges[0].base):
+                LOG.error(".NET assembly dump failed")
+                sys.exit(5)
+            LOG.info("Output file has been saved at 'unpacked_%s'",
+                     process_controller.main_module_name)
+            return
 
         LOG.info("OEP reached: OEP=%s BASE=%s DOTNET=%r", hex(dumped_oep),
                  hex(dumped_image_base), is_dotnet)
