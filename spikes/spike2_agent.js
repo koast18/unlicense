@@ -985,7 +985,16 @@ function stage1OnLicensePageAccess(details) {
     if (operation !== "read") {
         return true;
     }
-    const pc = details.context[PC_REG];
+    /* The guard bit is already consumed by this violation, so the instruction
+     * will retry and succeed. If the exception record carries no context we
+     * cannot read the pc; let the access through rather than returning false,
+     * which would hand a guard-page violation to the target's own SEH and
+     * kill the process. */
+    const ctx = details.context || null;
+    if (ctx === null) {
+        return true;
+    }
+    const pc = ctx[PC_REG];
     /* Only a read issued from the main module can be the license consumer:
      * the RSA code (libtomcrypt) is statically linked into it. Reads of the
      * same page from ntdll/kernelbase are heap bookkeeping, and treating one
@@ -1004,7 +1013,7 @@ function stage1OnLicensePageAccess(details) {
         scheduleRearm();
         return true;
     }
-    const context = details.context;
+    const context = ctx;
     const candidates = stage1ReturnCandidates(context);
     stage1.retCandidates = candidates;
     stage1Log("sub1-lic-page-access", "op=" + operation + " addr=" +
