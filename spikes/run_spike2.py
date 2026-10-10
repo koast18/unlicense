@@ -285,7 +285,13 @@ def ci_pass(args) -> int:
     by_label = {entry["label"]: entry for entry in manifest}
     dummy = Path(args.dummy)
     if not dummy.exists():
-        raise SystemExit(f"dummy license not found: {dummy}")
+        # Stage 0 only cares about the license head, so a synthetic dummy
+        # still exercises the whole redirect/map/copy/unmap path. Reported
+        # loudly so a wl-lic build failure cannot hide behind it.
+        print(f"WARNING: {dummy} missing (wl-lic build failed?) -- falling "
+              f"back to a synthetic dummy license", flush=True)
+        dummy.parent.mkdir(parents=True, exist_ok=True)
+        make_dummy_license(dummy)
     head_hex = dummy.read_bytes()[:HEAD_LEN].hex()
     nt_path = windows_nt_path(dummy)
     print(f"dummy license: {dummy} head={head_hex} nt={nt_path}", flush=True)

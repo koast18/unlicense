@@ -73,6 +73,13 @@ def build_mingw(wlic: Path, out: Path, work: Path) -> dict:
         return {"compiler": "mingw", "status": "not available"}
     cpp, c, includes = sources(wlic)
     inc = [f"-I{p}" for p in includes]
+    # wl-lic was written against MSVC's headers, which include the C string
+    # functions transitively; gcc needs them spelled out (crypt.cpp uses
+    # strlen without including <cstring>). Force the common ones in rather
+    # than patching the author's sources.
+    forced = ["-include", "cstring", "-include", "cstdio",
+              "-include", "cstdlib", "-include", "cstdint",
+              "-include", "string", "-include", "cmath"]
     work.mkdir(parents=True, exist_ok=True)
     objects = []
     for source in c:
@@ -85,8 +92,8 @@ def build_mingw(wlic: Path, out: Path, work: Path) -> dict:
         objects.append(str(obj))
     for source in cpp:
         obj = work / (source.stem + ".o")
-        proc = subprocess.run([gxx, "-c", "-O1", "-w", "-std=c++17", *inc,
-                               "-o", str(obj), str(source)],
+        proc = subprocess.run([gxx, "-c", "-O1", "-w", "-std=c++17", *forced,
+                               *inc, "-o", str(obj), str(source)],
                               capture_output=True, text=True)
         if proc.returncode != 0:
             return {"compiler": "mingw", "status": "C++ compile failed",
@@ -126,16 +133,38 @@ def build_msvc(wlic: Path, out: Path, work: Path) -> dict:
         return {"compiler": "msvc", "status": "vcvarsall.bat not found"}
     cpp, c, includes = sources(wlic)
     inc = [f"/I{p}" for p in includes]
+    objdir = work / "obj"
     work.mkdir(parents=True, exist_ok=True)
-    command = (f'call "{vcvars}" x64 >nul && cl /nologo /O2 /EHsc /MT '
-               f'/Fe:"{out}" {" ".join(inc)} '
-               f'{" ".join(str(p) for p in cpp + c)}')
+    shutil.rmtree(objdir, ignore_errors=True)
+    objdir.mkdir(parents=True, exist_ok=True)
+
+    # 163 translation units in a single cl invocation exceeds the Windows
+    # command line limit ("The command line is too long"), so compile in
+    # chunks through response files and link the objects afterwards.
+    sources_list = [str(p) for p in cpp] + [str(p) for p in c]
+    chunk_size = 25
+    commands = []
+    for index in range(0, len(sources_list), chunk_size):
+        chunk = sources_list[index:index + chunk_size]
+        response = work / f"compile{index // chunk_size}.rsp"
+        response.write_text(" ".join(["/nologo", "/c", "/O2", "/EHsc", "/MT",
+                                      f"/Fo{objdir}\\", *inc, *chunk]))
+        commands.append(f'cl @"{response}"')
+    objects = sorted(str(p) for p in objdir.glob("*.obj"))
+    if len(objects) != len(sources_list):
+        return {"compiler": "msvc", "status": "object count mismatch",
+                "expected": len(sources_list), "got": len(objects)}
+    link_response = work / "link.rsp"
+    link_response.write_text(" ".join(["/nologo", f'/OUT:"{out}"', *objects]))
+    commands.append(f'link @"{link_response}"')
+    command = f'call "{vcvars}" x64 >nul && ' + " && ".join(commands)
     proc = subprocess.run(["cmd", "/c", command], capture_output=True,
                           text=True, cwd=str(work))
     if proc.returncode != 0 or not out.exists():
         return {"compiler": "msvc", "status": "build failed",
-                "stderr": (proc.stdout + proc.stderr)[-1200:]}
-    return {"compiler": "msvc", "status": "ok", "vcvars": vcvars}
+                "stderr": (proc.stdout + proc.stderr)[-1500:]}
+    return {"compiler": "msvc", "status": "ok", "vcvars": vcvars,
+            "objects": len(objects)}
 
 
 def main() -> int:

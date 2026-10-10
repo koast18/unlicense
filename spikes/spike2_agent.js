@@ -251,6 +251,13 @@ function installWindowsHooks() {
     plan.redirectBuffer = Memory.allocUtf16String(plan.ntPath);
     const nameOffset = PTR_SIZE === 8 ? 0x10 : 0x8;
     const bufferOffset = PTR_SIZE === 8 ? 0x8 : 0x4;
+    /* RootDirectory is the second field of OBJECT_ATTRIBUTES. Our replacement
+     * path is always absolute (\??\...), and the object manager rejects an
+     * absolute ObjectName combined with a non-NULL RootDirectory with
+     * STATUS_INVALID_PARAMETER (CreateFile -> error 87). That is exactly what
+     * happens when the target opens a *relative* "regkey.dat": kernel32 sets
+     * RootDirectory to the current directory handle. Zero it. */
+    const rootOffset = PTR_SIZE === 8 ? 0x8 : 0x4;
 
     const createFileHook = function (callSite) {
         return function (args) {
@@ -282,9 +289,16 @@ function installWindowsHooks() {
             report.mainThread = plan.mainThread;
             report.redirectedVia = callSite;
             stats.redirects++;
+            const previousRoot = objectAttributes.add(rootOffset)
+                .readPointer();
             objectName.writeU16(plan.ntPath.length * 2);
             objectName.add(2).writeU16((plan.ntPath.length + 1) * 2);
             objectName.add(bufferOffset).writePointer(plan.redirectBuffer);
+            if (!previousRoot.isNull()) {
+                objectAttributes.add(rootOffset).writePointer(ptr(0));
+                report.clearedRootDirectory =
+                    (report.clearedRootDirectory || 0) + 1;
+            }
             emit({
                 spike: "redirect",
                 via: callSite,
