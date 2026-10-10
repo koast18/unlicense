@@ -375,40 +375,34 @@ function stage2OnGuardAccess(details) {
 
 function stage2FollowThreads() {
     const s2 = stage2State();
-    /* Clean re-attach: unfollow first (the threads are still followed from
-     * Stage 0), then flush the compiled-block cache, then follow again.
-     * Following an already-followed thread does not install a new transform,
-     * and a cached block built without the Stage 2 check is never revisited --
-     * together those left the window tracing ~131 instructions and seeing two
-     * cmp instructions in a whole program. */
+    /* Only flush. Do NOT unfollow/re-follow here.
+     *
+     * The threads are already followed from Stage 0, and this function runs on
+     * the JS thread -- which is the thread that just took the guard violation.
+     * Calling Stalker.unfollow on that thread from inside its own deferred
+     * callback hangs it: the target stopped producing output right after the
+     * hash_3 read (no SPIKE2_HASH3 line, no SPIKE2_DONE) and the run grew from
+     * 26.6s to 37.6s with no report.
+     *
+     * Stalker.flush() invalidates the compiled blocks, which is the part that
+     * actually matters: the transform already carries the Stage 2 branch, but
+     * blocks compiled during Stage 0 were built before it existed and would
+     * never be revisited. */
+    let flushed = false;
     try {
-        for (const thread of Process.enumerateThreads()) {
-            try {
-                Stalker.unfollow(thread.id);
-            } catch (e) {
-                /* best effort */
-            }
-        }
         Stalker.flush();
+        flushed = true;
     } catch (e) {
         /* best effort */
     }
-    for (const thread of Process.enumerateThreads()) {
-        try {
-            Stalker.follow(thread.id, { transform: install });
-            s2.followed.push(thread.id);
-        } catch (e) {
-            /* best effort */
-        }
-    }
     s2.insideAtFollow = stats.inside;
-    stage2Log("following", s2.followed.length + " threads for the comparison" +
-        " (flushed; instructions seen so far " + stats.inside + ")");
-    /* Bounded window: if the comparison never shows up, stop tracing rather
-     * than leaving the target slowed down for the rest of the run. */
+    stage2Log("following", "flushed=" + flushed + " threads=" +
+        Process.enumerateThreads().length + " (already followed from Stage 0;" +
+        " instructions seen so far " + stats.inside + ")");
+    /* Bounded window: if the comparison never shows up, say so rather than
+     * leaving the target slowed down for the rest of the run. */
     setTimeout(function () {
         if (plan.stage2.sub === 2) {
-            stage2Unfollow();
             stage2Log("cmp-not-found", "no hash_3 comparison in the window; " +
                 "cmp seen=" + (s2.scanCmp || 0) +
                 " no-mem-or-reg=" + (s2.scanNoMemReg || 0) +
