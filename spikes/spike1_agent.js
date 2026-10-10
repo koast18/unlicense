@@ -219,6 +219,16 @@ function ctxName(context, name) {
     return name;
 }
 
+/* Windows prints %p without a 0x prefix; ptr() would read the hex digits as
+ * decimal and throw "expected a pointer". */
+function toPtr(value) {
+    let text = String(value).trim();
+    if (text.slice(0, 2).toLowerCase() !== "0x") {
+        text = "0x" + text;
+    }
+    return ptr(text);
+}
+
 function note(test, ok, detail) {
     report.results.push({ test: test, ok: !!ok, detail: String(detail) });
 }
@@ -478,17 +488,17 @@ rpc.exports = {
     setup: function (options) {
         plan = {
             addrs: {
-                g_magic: ptr(options.addrs.g_magic),
-                g_flag: ptr(options.addrs.g_flag),
-                g_sink: ptr(options.addrs.g_sink),
-                g_sink2: ptr(options.addrs.g_sink2)
+                g_magic: toPtr(options.addrs.g_magic),
+                g_flag: toPtr(options.addrs.g_flag),
+                g_sink: toPtr(options.addrs.g_sink),
+                g_sink2: toPtr(options.addrs.g_sink2)
             },
             funcs: {
-                branch: ptr(options.funcs.branch),
-                store: ptr(options.funcs.store),
-                pc: ptr(options.funcs.pc),
-                pc2: ptr(options.funcs.pc2),
-                reg: ptr(options.funcs.reg)
+                branch: toPtr(options.funcs.branch),
+                store: toPtr(options.funcs.store),
+                pc: toPtr(options.funcs.pc),
+                pc2: toPtr(options.funcs.pc2),
+                reg: toPtr(options.funcs.reg)
             },
             interceptor: null,
             roles: {},

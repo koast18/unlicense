@@ -34,16 +34,23 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def find_mingw_compiler() -> str:
-    """Reuse the toolchain the stub builder installs (tools/mingw/<arch>)."""
+    """Reuse the toolchain the stub builder installs (tools/mingw/<arch>).
+
+    install_mingw.install() short-circuits with "already installed" when the
+    marker exists (the CI step ran first) and that early-return path carries
+    no compiler path, so the toolchain is looked up on disk as well.
+    """
     import install_mingw  # noqa: E402  (script lives in scripts/)
 
     info = install_mingw.install(ARCH)
     compiler = info.get("compiler")
     if compiler and Path(compiler).exists():
         return compiler
-    # last resort: whatever is on PATH
     exe = ("i686-w64-mingw32-gcc.exe" if ARCH == "x86"
            else "x86_64-w64-mingw32-gcc.exe")
+    for candidate in sorted((ROOT / "tools" / "mingw" / ARCH)
+                            .glob("*/bin/" + exe)):
+        return str(candidate)
     found = shutil.which(exe)
     if found:
         return found
@@ -68,6 +75,15 @@ def build_target(opt: int) -> Path:
     print(f"built {out} ({out.stat().st_size} bytes) with {compiler}",
           flush=True)
     return out
+
+
+def normalize_addr(value: str) -> str:
+    """`%p` prints without the 0x prefix on Windows (mingw and MSVC), and
+    frida's ptr() then parses the hex digits as decimal and refuses."""
+    text = str(value).strip()
+    if not text.lower().startswith("0x"):
+        text = "0x" + text
+    return text
 
 
 def parse_target_line(text: str, tag: str) -> dict:
@@ -126,8 +142,10 @@ def run_one(binary: Path, opt: int, timeout: int,
         if "FUNC " in output["text"] and "ADDR " in output["text"]:
             break
         time.sleep(0.1)
-    addrs = parse_target_line(output["text"], "ADDR")
-    funcs = parse_target_line(output["text"], "FUNC")
+    addrs = {k: normalize_addr(v)
+             for k, v in parse_target_line(output["text"], "ADDR").items()}
+    funcs = {k: normalize_addr(v)
+             for k, v in parse_target_line(output["text"], "FUNC").items()}
     if not addrs or not funcs:
         return {"opt": opt, "error": "target never printed addresses",
                 "target_stdout": output["text"]}
@@ -296,10 +314,20 @@ def main() -> int:
     rows = []
     ok = True
     for opt in [int(o) for o in args.opts.split(",")]:
-        binary = build_target(opt)
-        row = run_one(binary, opt, args.timeout)
-        if args.nostalker:
-            rows.append(run_one(binary, opt, args.timeout, no_stalker=True))
+        try:
+            binary = build_target(opt)
+            row = run_one(binary, opt, args.timeout)
+            rows.append(row)
+            if args.nostalker:
+                rows.append(run_one(binary, opt, args.timeout,
+                                    no_stalker=True))
+        except Exception as exc:  # noqa: BLE001
+            # Keep the report shape even when a leg dies, so the artifact
+            # still shows what happened instead of just missing.
+            import traceback
+            rows.append({"opt": opt, "error": f"{exc}",
+                         "traceback": traceback.format_exc()})
+            ok = False
         rows.append(row)
         verdict = row.get("verdict", {})
         failed = verdict.get("failed", ["<run error>"])
