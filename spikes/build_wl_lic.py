@@ -112,8 +112,8 @@ def main() -> int:
         with open(gh_sum, "a", encoding="utf-8") as handle:
             handle.write(f"## wl-lic build\n\n{info['status']}\n\n")
             for attempt in attempts:
-                handle.write(f"- {attempt['compiler']}: "
-                             f"{attempt['status']}\n")
+                handle.write(f"- {attempt.get('compiler')}: "
+                             f"{attempt.get('status') or attempt}\n")
             handle.write("\n")
     return 0 if info["status"] == "ok" else 1
 

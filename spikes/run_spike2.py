@@ -126,7 +126,10 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         try:
             status = script.exports_sync.status()
         except Exception as exc:  # noqa: BLE001
-            status = {"error": str(exc)}
+            # The agent dies with the process; that is not a harness failure,
+            # it just means the sample exited. Everything already reported
+            # through send() is still in `messages`.
+            status = {"error": str(exc), "processGone": True}
             break
         if status.get("licCopy"):
             print(f"  stage0 complete: lic_copy={status['licCopy']}",
@@ -141,6 +144,7 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         final = script.exports_sync.finish()
     except Exception as exc:  # noqa: BLE001
         final = {"error": f"finish rpc failed: {exc}"}
+        final.update(report_from_messages(messages, status))
 
     exit_file.write_text("exit")
     time.sleep(0.3)
@@ -162,6 +166,45 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         "messages": messages,
         "final": final,
     }
+
+
+def report_from_messages(messages: list, status: dict) -> dict:
+    """Reconstruct the Stage 0 outcome from the send() stream.
+
+    Needed whenever the target exits before finish(): the frida script is
+    destroyed with the process, so the final RPC is gone, but every
+    interesting event was already emitted.
+    """
+    report = {"reconstructedFromMessages": True,
+              "openedPaths": [], "errors": []}
+    candidates = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        kind = message.get("spike")
+        if kind == "redirect":
+            report["originalLicensePath"] = message.get("original")
+            report.setdefault("redirects", 0)
+            report["redirects"] += 1
+        elif kind == "lic_mapped":
+            report["licenseMappedTo"] = message.get("addr")
+        elif kind == "candidate":
+            candidates.add(message.get("ea"))
+        elif kind == "lic_copy":
+            report["licCopy"] = message.get("addr")
+            report["licCopyFirstBytes"] = message.get("bytes")
+            report["candidates"] = sorted(candidates)
+    if isinstance(status, dict):
+        report["stats"] = {
+            "redirects": status.get("redirects", report.get("redirects", 0)),
+            "fileOpens": status.get("fileOpens", 0),
+            "byteWrites": status.get("byteWrites", 0),
+            "byteStoresPlanned": status.get("byteStoresPlanned", 0),
+            "processGone": status.get("processGone", False)
+        }
+        if status.get("openedPaths"):
+            report["openedPaths"] = status["openedPaths"]
+    return report
 
 
 def judge_local(run: dict, head_hex: str) -> dict:
