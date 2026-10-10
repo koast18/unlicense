@@ -489,6 +489,25 @@ function stage2RecogniseCmp(insn) {
         }
         return null;
     }
+    if (s2 !== undefined && s2.scanShapeLogged !== true) {
+        s2.scanShapeLogged = true;
+        try {
+            const v = mem.value;
+            let shape = typeof v;
+            if (v !== null && typeof v === "object") {
+                shape += " keys=[" + Object.keys(v).join(",") + "]" +
+                    " base=" + String(v.base) +
+                    " index=" + String(v.index) +
+                    " disp=" + String(v.disp);
+            } else {
+                shape += " str=" + String(v);
+            }
+            stage2Log("cmp-mem-shape", "type=" + shape +
+                " resolved=" + stage2MemBaseOf(mem) + " size=" + mem.size);
+        } catch (e) {
+            /* diagnostics must never break recognition */
+        }
+    }
     const regName = String(reg.value).trim();
     if (WORD_REGISTERS[regName] === undefined) {
         if (s2 !== undefined) {
@@ -499,9 +518,33 @@ function stage2RecogniseCmp(insn) {
     }
     return {
         address: insn.address.toString(),
-        memBase: mem.value,
+        memBase: stage2MemBaseOf(mem),
         regName: regName
     };
+}
+
+/* The base register of a Frida x86 memory operand. `operand.value` is NOT the
+ * base register name here -- it is an object, and String() of it is the literal
+ * "[object Object]", which then fails the CpuContext lookup in stage2ApplyCmp.
+ * That one detail is what kept Stage 2 reporting "cmp-not-found" with exactly
+ * one callout fired and noBase=1. Accept a string when Frida gives one,
+ * otherwise pull `base` (a string, or a nested object carrying `value`) out. */
+function stage2MemBaseOf(mem) {
+    const v = mem.value;
+    if (typeof v === "string") {
+        return v.trim();
+    }
+    if (v !== null && typeof v === "object") {
+        const raw = v.base;
+        if (typeof raw === "string") {
+            return raw.trim();
+        }
+        if (raw !== null && typeof raw === "object" &&
+            typeof raw.value === "string") {
+            return raw.value.trim();
+        }
+    }
+    return String(v).trim();
 }
 
 function stage2ApplyCmp(context, site) {
