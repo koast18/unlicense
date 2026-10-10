@@ -918,51 +918,51 @@ function stage1IsExecutable(address) {
     }
 }
 
-function stage1ReturnCandidates(context) {
+function stage1RankCandidates(snapshot) {
     const slots = [];
-    /* Thread.backtrace resolves the real call stack for a context, which is
-     * far more reliable than guessing stack offsets: the frame size of the
-     * function that read the license varies with the build, and the x64
-     * mimic run showed the return address sitting beyond every offset the
-     * old scan tried. backtrace[0] is the return address of the function
-     * that performed the read, i.e. the caller we want. */
-    let frames = [];
+    const pc = snapshot.pc;
+    /* Rank by "same memory range as the code that did the read": the caller
+     * (rsa_exptmod) lives in the same private allocation as
+     * mp_read_unsigned_bin, so a stack slot pointing into that range is the
+     * return address we want.
+     *
+     * Thread.backtrace is deliberately NOT used. Calling it from inside the
+     * exception handler killed the target outright (run 38042084163), and the
+     * old [sp+0..0x28] scan was too narrow -- mp_read_unsigned_bin's frame is
+     * bigger, and on the x64 mimic target no candidate came anywhere near the
+     * reading pc. */
+    let preferred = null;
     try {
-        frames = Thread.backtrace(context, Backtracer.ACCURATE);
+        preferred = Process.findRangeByAddress(pc);
     } catch (e) {
-        frames = [];
+        preferred = null;
     }
-    for (const frame of frames) {
-        const module = Process.findModuleByAddress(frame);
+    for (const slot of snapshot.values) {
+        const value = slot.value;
+        const module = Process.findModuleByAddress(value);
+        const executable = stage1IsExecutable(value);
+        let sameRange = false;
+        if (preferred !== null && executable) {
+            try {
+                const range = Process.findRangeByAddress(value);
+                sameRange = range !== null &&
+                    range.base.equals(preferred.base);
+            } catch (e) {
+                sameRange = false;
+            }
+        }
         slots.push({
-            offset: null,
-            label: "frame",
-            value: frame.toString(),
-            inModule: !stage1IsSystemModule(module) &&
-                stage1IsExecutable(frame)
+            offset: slot.offset,
+            label: "sp+" + slot.offset.toString(16),
+            value: value.toString(),
+            inModule: !stage1IsSystemModule(module) && executable,
+            sameRange: sameRange
         });
     }
-    if (frames.length > 0) {
-        return slots;
-    }
-    /* Fallback when no backtrace is available: the original offset scan. */
-    const sp = context[SP_REG];
-    for (const offset of plan.retCandidates) {
-        try {
-            const value = sp.add(offset).readPointer();
-            const module = Process.findModuleByAddress(value);
-            slots.push({
-                offset: offset,
-                label: "sp+" + offset.toString(16),
-                value: value.toString(),
-                inModule: !stage1IsSystemModule(module) &&
-                    stage1IsExecutable(value)
-            });
-        } catch (e) {
-            slots.push({ offset: offset, label: "sp+" +
-                offset.toString(16), value: "unreadable" });
-        }
-    }
+    /* Same-range candidates first: they are the plausible callers. */
+    slots.sort(function (a, b) {
+        return (b.sameRange ? 1 : 0) - (a.sameRange ? 1 : 0);
+    });
     return slots;
 }
 
@@ -1153,7 +1153,38 @@ function stage1OnLicensePageAccess(details) {
         stage1Log("sub1-landmark-module", "pc=" + pc + " in " +
             (from === null ? "<private>" : from.name));
     }
-    return stage1TakeLandmark(ctx, "op=" + operation + " addr=" + address);
+    /* Minimal work inside the exception handler. Reading a window of raw
+     * stack slots and the pc is cheap and safe; every range lookup, sort and
+     * Interceptor.attach is deferred to the JS thread. Doing the heavy
+     * version in the handler is what killed the target in run 38042084163
+     * (process gone right after sub1-landmark-module, with no
+     * exception-handler-error logged). */
+    const snapshot = stage1CaptureLandmark(ctx);
+    setTimeout(function () {
+        stage1TakeLandmark(snapshot, "op=" + operation + " addr=" + address);
+    }, 0);
+    return true;
+}
+
+/* Capture only what is valid inside the exception handler: the pc and the
+ * raw stack window. Returns a plain object, so nothing here depends on the
+ * CpuContext staying alive. */
+function stage1CaptureLandmark(context) {
+    const pc = context[PC_REG];
+    const sp = context[SP_REG];
+    const values = [];
+    const step = Process.pointerSize;
+    for (let offset = 0; offset <= 0x400; offset += step) {
+        try {
+            values.push({
+                offset: offset,
+                value: sp.add(offset).readPointer()
+            });
+        } catch (e) {
+            break;
+        }
+    }
+    return { pc: pc, values: values };
 }
 
 /* Sub-stage 1 landmark, shared by both landmark mechanisms.
@@ -1162,14 +1193,15 @@ function stage1OnLicensePageAccess(details) {
  * (Frida exposes no Dr6), but both know the pc and the stack. Everything
  * after the landmark is identical, so it lives here.
  */
-function stage1TakeLandmark(context, label) {
+function stage1TakeLandmark(snapshot, label) {
     const stage1 = plan.stage1;
-    const candidates = stage1ReturnCandidates(context);
+    const candidates = stage1RankCandidates(snapshot);
     stage1.retCandidates = candidates;
-    stage1Log("sub1-lic-page-access", label + " pc=" + context[PC_REG] + " " +
-        candidates.map(function (candidate) {
+    stage1Log("sub1-lic-page-access", label + " pc=" + snapshot.pc + " " +
+        candidates.slice(0, 12).map(function (candidate) {
             return "[" + stage1CandidateLabel(candidate) + "]=" +
-                candidate.value + (candidate.inModule ? " (code)" : "");
+                candidate.value + (candidate.inModule ? " (code)" : "") +
+                (candidate.sameRange ? " (same-range)" : "");
         }).join(" "));
     /* The guard bit is already cleared by the OS, so the instruction will
      * succeed on retry; no re-protect is needed. */
@@ -1308,7 +1340,7 @@ rpc.exports = {
                     return;
                 }
                 disarmGuard();
-                stage1TakeLandmark(context, "hwbreak");
+                stage1TakeLandmark(stage1CaptureLandmark(context), "hwbreak");
             },
             /* x86 reads the RSA arguments off the stack; x64 keeps them in
              * registers (mp_exptmod(G, X, P, Y): X = exponent, P = modulus,
