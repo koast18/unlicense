@@ -31,6 +31,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SPIKES = ROOT / "spikes"
 RESULTS = ROOT / "results"
+
+
+def load_agent_source() -> str:
+    """Concatenate the agent modules into one script.
+
+    Frida evaluates a single source string, so the helper modules are inlined
+    ahead of the main agent. Their ``module.exports`` guards are inert here
+    (``module`` is undefined inside the agent runtime), which is exactly why
+    the modules are safe to concatenate.
+    """
+    parts = []
+    for name in ("hwbreak_agent.js", "spike2_agent.js"):
+        path = SPIKES / name
+        if path.exists():
+            parts.append(path.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 BUILD = RESULTS / "spike2_build"
 
 IS_WINDOWS = sys.platform == "win32"
@@ -141,7 +159,7 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
     started = time.time()
     pid = device.spawn([str(exe)], cwd=str(workdir), stdio="pipe")
     session = device.attach(pid)
-    script = session.create_script((SPIKES / "spike2_agent.js").read_text())
+    script = session.create_script(load_agent_source())
     script.on("message", on_message)
     script.load()
 

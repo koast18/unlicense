@@ -1013,11 +1013,20 @@ function stage1OnLicensePageAccess(details) {
         scheduleRearm();
         return true;
     }
-    const context = ctx;
+    return stage1TakeLandmark(ctx, "op=" + operation + " addr=" + address);
+}
+
+/* Sub-stage 1 landmark, shared by both landmark mechanisms.
+ *
+ * The guard page knows the accessed address; a hardware breakpoint does not
+ * (Frida exposes no Dr6), but both know the pc and the stack. Everything
+ * after the landmark is identical, so it lives here.
+ */
+function stage1TakeLandmark(context, label) {
+    const stage1 = plan.stage1;
     const candidates = stage1ReturnCandidates(context);
     stage1.retCandidates = candidates;
-    stage1Log("sub1-lic-page-access", "op=" + operation + " addr=" +
-        address + " pc=" + context[PC_REG] + " " +
+    stage1Log("sub1-lic-page-access", label + " pc=" + context[PC_REG] + " " +
         candidates.map(function (candidate) {
             return "[sp+" + candidate.offset.toString(16) + "]=" +
                 candidate.value + (candidate.inModule ? " (code)" : "");
@@ -1034,9 +1043,7 @@ function stage1OnLicensePageAccess(details) {
     if (usable.length === 0) {
         stage1Log("sub1-no-code-return-candidate", "logged candidates above");
         /* No stack slot held a code address, so there is nothing to hook.
-         * The page is already unprotected (the guard bit was consumed), so
-         * this run cannot learn more; report it instead of re-arming, which
-         * would spin the thread. */
+         * Report it rather than re-arming, which would spin the thread. */
         report.stage1NoReturnCandidate = true;
         return true;
     }
@@ -1099,6 +1106,18 @@ function startStage1(licCopy) {
         stage1Log("guard-failed", String(e) + " -- falling back to " +
             "unguarded detection");
     }
+    /* Second, independent landmark mechanism: data breakpoints on the byte
+     * store candidates. Exact, so it needs no collateral filtering and no
+     * re-arming. Both run at once; whichever sees the license first wins and
+     * the other is torn down. */
+    try {
+        const addresses = Object.keys(plan.copySet).map(function (a) {
+            return ptr(a);
+        });
+        hwBreakInstall(plan, addresses);
+    } catch (e) {
+        stage1Log("hwbreak-install-failed", String(e));
+    }
 }
 
 rpc.exports = {
@@ -1136,6 +1155,21 @@ rpc.exports = {
             followed: [],
             tracing: false,
             exceptionsSeen: 0,
+            /* Hardware-breakpoint landmark (spikes/hwbreak_agent.js). Both
+             * mechanisms run at once: whichever sees the license first takes
+             * sub-stage 1, and the other is torn down. */
+            emit: emit,
+            PC_REG: PC_REG,
+            hwBreakActive: false,
+            hwBreakThreads: [],
+            hwBreakHits: 0,
+            onHwBreakLandmark: function (context) {
+                if (plan.stage1.sub !== 1) {
+                    return;
+                }
+                disarmGuard();
+                stage1TakeLandmark(context, "hwbreak");
+            },
             /* x86 reads the RSA arguments off the stack; x64 keeps them in
              * registers (mp_exptmod(G, X, P, Y): X = exponent, P = modulus,
              * i.e. the 2nd and 3rd arguments). */
@@ -1230,6 +1264,9 @@ rpc.exports = {
                                details.memory.address)
                             : "none"));
                 }
+                if (hwBreakOnException(plan, details)) {
+                    return true;
+                }
                 return stage1OnLicensePageAccess(details);
             } catch (e) {
                 stage1Log("exception-handler-error", String(e));
@@ -1280,6 +1317,8 @@ rpc.exports = {
             stage1GuardArmed: plan.stage1.guardArmed,
             stage1CollateralReads: plan.stage1.collateralReads,
             stage1Rearms: plan.stage1.rearms,
+            stage1HwBreakActive: plan.hwBreakActive,
+            stage1HwBreakHits: plan.hwBreakHits,
             stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
