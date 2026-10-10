@@ -210,9 +210,14 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
         # Stage 0 finishing is not the end any more: Stage 1 (the RSA chain)
         # is what this run is for, so keep going until it completes or the
         # duration runs out.
-        if status.get("stage1Complete") or                 (status.get("stage1Sub") or 0) >= 6:
-            print("  stage1 complete", flush=True)
+        # Stage 1 finishing is not the end any more: Stage 2 (the hash_3
+        # comparison) runs on the decrypted buffer Stage 1 produced, so keep
+        # going until Stage 2 completes or the duration runs out.
+        if (status.get("stage2Sub") or 0) >= 3:
+            print("  stage2 complete", flush=True)
             break
+        if status.get("stage1Complete") or (status.get("stage1Sub") or 0) >= 6:
+            print("  stage1 complete", flush=True)
         if time.time() - last_report >= 15:
             last_report = time.time()
             print(f"  ... {status}", flush=True)

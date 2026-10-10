@@ -217,6 +217,283 @@ function recordCandidate(info, context) {
     }
 }
 
+/* ======================================================================
+ * Stage 2 -- find and bypass the hash_3 comparison
+ * (port of wl-extract/staging/stage2.cpp)
+ *
+ *   sub 1  the first 2-byte read of dec_lic + 0x33 is the landmark, via the
+ *          same guard-page mechanism as Stage 1
+ *   sub 2  find 'cmp word ptr [reg1], reg2'; exactly one operand is the
+ *          hash_3 we generated, the other is the value the program expects
+ *   sub 3  hand dec_lic to Stage 3
+ *
+ * whatlicense forces the comparison with EFLAGS=0x200242 + PIN_ExecuteAt(addr+3).
+ * Neither works in Frida (CpuContext has no flags field, and writing the pc has
+ * no effect -- both verified in Spike 1), so the comparison is neutralised:
+ * whichever operand holds our hash_3 is overwritten with the expected value, so
+ * the cmp sets the flags on its own and the program's own branch does the rest.
+ *
+ * Sub-stage 2 needs instruction-level visibility, which a guard page cannot
+ * give: the comparison reads a register, not dec_lic + 0x33 (whatlicense notes
+ * WL shuffles the value through push/pop before using it). Stalker is
+ * re-followed for that window and unfollowed again afterwards.
+ * ====================================================================== */
+const HASH3_OFFSET = 0x33;
+
+const WORD_REGISTERS = {
+    ax: "eax", cx: "ecx", dx: "edx", bx: "ebx",
+    sp: "esp", bp: "ebp", si: "esi", di: "edi",
+    r8w: "r8", r9w: "r9", r10w: "r10", r11w: "r11",
+    r12w: "r12", r13w: "r13", r14w: "r14", r15w: "r15"
+};
+
+function stage2State() {
+    if (plan.stage2 === undefined) {
+        plan.stage2 = {
+            active: false, sub: 0, decLic: null, hash3: 0,
+            guardStart: null, guardLength: 0, hits: 0, rearms: 0,
+            rearmPending: false, cmpAddress: null, realHash3: null,
+            cmpCandidates: 0, neutralised: 0, followed: []
+        };
+    }
+    return plan.stage2;
+}
+
+function stage2Log(event, detail) {
+    emit({ spike: "stage2", event: event, detail: detail });
+}
+
+function stage2ArmGuard() {
+    const s2 = stage2State();
+    if (s2.guardStart === null || s2.guardLength <= 0) {
+        return false;
+    }
+    const old = Memory.alloc(4);
+    return getVirtualProtect()(s2.guardStart, s2.guardLength,
+        PAGE_READWRITE | PAGE_GUARD, old) !== 0;
+}
+
+function stage2DisarmGuard() {
+    const s2 = stage2State();
+    if (s2.guardStart === null || s2.guardLength <= 0) {
+        return;
+    }
+    const old = Memory.alloc(4);
+    getVirtualProtect()(s2.guardStart, s2.guardLength, PAGE_READWRITE, old);
+}
+
+/* Same rule as Stage 1: re-arm only from the JS thread, never inside the
+ * exception handler, or the retrying instruction faults on itself forever. */
+function stage2ScheduleRearm() {
+    const s2 = stage2State();
+    if (!s2.active || s2.sub !== 1 || s2.rearmPending ||
+        s2.rearms >= MAX_REARMS) {
+        return;
+    }
+    s2.rearmPending = true;
+    setTimeout(function () {
+        s2.rearmPending = false;
+        if (plan.stage2.active && plan.stage2.sub === 1) {
+            plan.stage2.rearms++;
+            stage2ArmGuard();
+        }
+    }, 0);
+}
+
+function startStage2(decLic) {
+    const s2 = stage2State();
+    s2.active = true;
+    s2.sub = 1;
+    s2.decLic = ptr(decLic);
+    try {
+        s2.hash3 = s2.decLic.add(HASH3_OFFSET).readU16();
+    } catch (e) {
+        s2.hash3 = 0;
+    }
+    const target = s2.decLic.add(HASH3_OFFSET);
+    const pageSize = Process.pageSize;
+    s2.guardStart = target.and(ptr(pageSize - 1).not());
+    s2.guardLength = pageSize;
+    stage2Log("start", "dec_lic=" + s2.decLic + " hash3=0x" +
+        s2.hash3.toString(16) + " guard=" + s2.guardStart + "+0x" +
+        s2.guardLength.toString(16) + " armed=" + stage2ArmGuard());
+}
+
+function stage2OnGuardAccess(details) {
+    const s2 = plan.stage2;
+    if (s2 === undefined || !s2.active || s2.guardStart === null) {
+        return false;
+    }
+    const memory = details.memory || null;
+    let address = null;
+    let operation = "read";
+    if (memory !== null) {
+        address = memory.address;
+        operation = memory.operation || "read";
+    }
+    if ((address === null || address === undefined) &&
+        details.address !== undefined && details.address !== null) {
+        address = details.address;
+    }
+    if (address === null || address === undefined) {
+        return false;
+    }
+    if (address.compare(s2.guardStart) < 0 ||
+        address.compare(s2.guardStart.add(s2.guardLength)) >= 0) {
+        return false;
+    }
+    s2.hits++;
+    if (s2.sub !== 1) {
+        stage2DisarmGuard();
+        return true;
+    }
+    if (operation !== "read" ||
+        address.compare(s2.decLic.add(HASH3_OFFSET)) !== 0) {
+        stage2ScheduleRearm();
+        return true;
+    }
+    const ctx = details.context || null;
+    stage2Log("hash3-read", "pc=" + (ctx === null ? "?" : ctx[PC_REG]) +
+        " hits=" + s2.hits);
+    s2.sub = 2;
+    stage2DisarmGuard();
+    stage2FollowThreads();
+    return true;
+}
+
+function stage2FollowThreads() {
+    const s2 = stage2State();
+    for (const thread of Process.enumerateThreads()) {
+        try {
+            Stalker.follow(thread.id, { transform: install });
+            s2.followed.push(thread.id);
+        } catch (e) {
+            /* best effort */
+        }
+    }
+    stage2Log("following", s2.followed.length + " threads for the comparison");
+    /* Bounded window: if the comparison never shows up, stop tracing rather
+     * than leaving the target slowed down for the rest of the run. */
+    setTimeout(function () {
+        if (plan.stage2.sub === 2) {
+            stage2Unfollow();
+            stage2Log("cmp-not-found", "no hash_3 comparison in the window");
+        }
+    }, 8000);
+}
+
+function stage2Unfollow() {
+    const s2 = stage2State();
+    for (const tid of s2.followed) {
+        try {
+            Stalker.unfollow(tid);
+        } catch (e) {
+            /* best effort */
+        }
+    }
+    try {
+        Stalker.flush();
+    } catch (e) {
+        /* best effort */
+    }
+    s2.followed = [];
+}
+
+/* Called from the Stalker transform. Returns a site description when the
+ * instruction is 'cmp word ptr [reg1], reg2' -- whatlicense's
+ * isWordPtrRegCmp -- or null. The Instruction object is only valid inside the
+ * transform, so the values are read later from the callout's context. */
+function stage2RecogniseCmp(insn) {
+    if (insn.mnemonic !== "cmp" || insn.operands.length !== 2) {
+        return null;
+    }
+    let mem = null;
+    let reg = null;
+    for (const operand of insn.operands) {
+        if (operand.type === "mem") {
+            mem = operand;
+        } else if (operand.type === "reg") {
+            reg = operand;
+        }
+    }
+    if (mem === null || reg === null) {
+        return null;
+    }
+    if (mem.size !== 2 || reg.size !== 2) {
+        return null;
+    }
+    return {
+        address: insn.address.toString(),
+        memBase: mem.value,
+        regName: reg.value
+    };
+}
+
+function stage2ApplyCmp(context, site) {
+    const s2 = stage2State();
+    if (!s2.active || s2.sub !== 2) {
+        return;
+    }
+    const base = String(site.memBase).trim();
+    if (!Object.prototype.hasOwnProperty.call(context, base)) {
+        return;
+    }
+    let memVal;
+    try {
+        memVal = context[base].readU16();
+    } catch (e) {
+        return;
+    }
+    const regName = String(site.regName).trim();
+    const parent = WORD_REGISTERS[regName];
+    if (parent === undefined || context[parent] === undefined) {
+        return;
+    }
+    const regVal = context[parent].and(0xffff).toUInt32();
+
+    s2.cmpCandidates++;
+    if (s2.cmpCandidates <= 4) {
+        stage2Log("cmp-candidate", "pc=" + site.address + " mem[" + base +
+            "]=0x" + memVal.toString(16) + " " + regName + "=0x" +
+            regVal.toString(16) + " ours=0x" + s2.hash3.toString(16));
+    }
+
+    /* Exactly one operand is the hash_3 we generated; the other is what the
+     * program expects. Same rule as stage2.cpp's find_hash_cmp. */
+    let expected = null;
+    let oursIsMem = false;
+    if (memVal !== s2.hash3) {
+        if (regVal !== s2.hash3) {
+            return;
+        }
+        expected = memVal;
+    } else {
+        expected = regVal;
+        oursIsMem = true;
+    }
+
+    s2.realHash3 = expected;
+    s2.cmpAddress = site.address;
+    s2.sub = 3;
+    stage2Log("hash3-found", "hash_3=" + expected + " (0x" +
+        expected.toString(16) + ") ours=0x" + s2.hash3.toString(16) +
+        " oursIsMem=" + oursIsMem);
+
+    if (oursIsMem) {
+        context[base].writeU16(expected);
+        stage2Log("bypass", "[" + base + "] <- 0x" + expected.toString(16));
+    } else {
+        const upper = context[parent].and(ptr(0xffff).not());
+        context[parent] = upper.or(ptr(expected & 0xffff));
+        stage2Log("bypass", regName + " <- 0x" + expected.toString(16));
+    }
+    s2.neutralised++;
+    stage2Unfollow();
+    stage2Log("complete", "advance(dec_lic=" + s2.decLic + ")");
+    emit({ spike: "stage2_complete", hash3: expected,
+           decLic: s2.decLic.toString(), cmpSite: site.address });
+}
+
 function install(iterator) {
     let insn;
     while ((insn = iterator.next()) !== null) {
@@ -251,6 +528,22 @@ function install(iterator) {
          * (exception handler) and sub-stages 3/4 a static call scan, both of
          * which leave the target running at native speed until it touches
          * what we care about. */
+        /* Stage 2 sub-stage 2 is the exception: it needs the comparison, which
+         * reads a register rather than dec_lic, so it runs only inside the
+         * bounded window Stage 2 opens for itself. */
+        if (plan.stage2 !== undefined && plan.stage2.active &&
+            plan.stage2.sub === 2) {
+            const site = stage2RecogniseCmp(insn);
+            if (site !== null) {
+                iterator.putCallout(function (context) {
+                    try {
+                        stage2ApplyCmp(context, site);
+                    } catch (e) {
+                        /* never let a callout kill the trace */
+                    }
+                });
+            }
+        }
         iterator.keep();
     }
 }
@@ -710,6 +1003,11 @@ function stage1MpExptmodEnter(context) {
         report.stage1Complete = true;
         stage1Log("complete", "dec_lic=" + stage1.decLic +
             " (RSA-decrypted license buffer, Stage 2 input)");
+        /* Hand the decrypted buffer to Stage 2, which keys on the 2-byte
+         * read of dec_lic + 0x33 (stage2.cpp's stage2::init). */
+        if (stage1.decLic !== null && stage1.decLic !== undefined) {
+            startStage2(stage1.decLic);
+        }
     }
 }
 
@@ -922,6 +1220,11 @@ function stage1CallCandidate(context, destination) {
         report.stage1Complete = true;
         stage1Log("complete", "dec_lic=" + stage1.decLic +
             " (RSA-decrypted license buffer, Stage 2 input)");
+        /* Hand the decrypted buffer to Stage 2, which keys on the 2-byte
+         * read of dec_lic + 0x33 (stage2.cpp's stage2::init). */
+        if (stage1.decLic !== null && stage1.decLic !== undefined) {
+            startStage2(stage1.decLic);
+        }
     }
 }
 
@@ -1507,6 +1810,9 @@ rpc.exports = {
                 if (hwBreakOnException(plan, details)) {
                     return true;
                 }
+                if (stage2OnGuardAccess(details)) {
+                    return true;
+                }
                 return stage1OnLicensePageAccess(details);
             } catch (e) {
                 stage1Log("exception-handler-error", String(e));
@@ -1560,6 +1866,12 @@ rpc.exports = {
             stage1HwBreakActive: plan.hwBreakActive,
             stage1HwBreakHits: plan.hwBreakHits,
             messageBoxes: plan.messageBoxes || 0,
+            stage2Sub: plan.stage2 === undefined ? 0 : plan.stage2.sub,
+            stage2Hash3: plan.stage2 === undefined
+                ? null : plan.stage2.realHash3,
+            stage2CmpCandidates: plan.stage2 === undefined
+                ? 0 : plan.stage2.cmpCandidates,
+            stage2Hits: plan.stage2 === undefined ? 0 : plan.stage2.hits,
             stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
