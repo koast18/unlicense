@@ -9,6 +9,11 @@ name: spike2
 
 on:
   workflow_dispatch:
+    inputs:
+      samples:
+        description: "Also run the real samples (known CI dead end, ~12 min of the x86 leg)"
+        type: boolean
+        default: false
   push:
     branches: [main, dev]
     paths:
@@ -44,6 +49,8 @@ jobs:
         with:
           python-version: "3.11"
           architecture: ${{ matrix.python_arch }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
 
       - name: Exclude workspace from Windows Defender
         shell: pwsh
@@ -69,6 +76,7 @@ jobs:
       # symbol names matter, and install_mingw.py now has a pinned-asset
       # fallback for the rate-limited release API.
       - name: Fetch mingw-w64 for this architecture
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
         run: python scripts/install_mingw.py
 
@@ -115,6 +123,7 @@ jobs:
         run: python spikes/run_spike2.py --local --opts 0 --duration 25
 
       - name: Prepare samples and stub DLLs
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
         run: |
           python scripts/prepare_samples.py
@@ -123,6 +132,7 @@ jobs:
           Test-Path results/manifest.json
 
       - name: Spike 2 against real samples (Stage 0)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.samples }}
         continue-on-error: true
         run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ matrix.targets }} --duration 240
 
