@@ -30,50 +30,20 @@ BUILD = RESULTS / "spike1_build"
 IS_WINDOWS = sys.platform == "win32"
 ARCH = "x64" if sys.maxsize > 2 ** 32 else "x86"
 
-sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(SPIKES))
 
-
-def find_mingw_compiler() -> str:
-    """Reuse the toolchain the stub builder installs (tools/mingw/<arch>).
-
-    install_mingw.install() short-circuits with "already installed" when the
-    marker exists (the CI step ran first) and that early-return path carries
-    no compiler path, so the toolchain is looked up on disk as well.
-    """
-    import install_mingw  # noqa: E402  (script lives in scripts/)
-
-    info = install_mingw.install(ARCH)
-    compiler = info.get("compiler")
-    if compiler and Path(compiler).exists():
-        return compiler
-    exe = ("i686-w64-mingw32-gcc.exe" if ARCH == "x86"
-           else "x86_64-w64-mingw32-gcc.exe")
-    for candidate in sorted((ROOT / "tools" / "mingw" / ARCH)
-                            .glob("*/bin/" + exe)):
-        return str(candidate)
-    found = shutil.which(exe)
-    if found:
-        return found
-    raise SystemExit(f"no mingw-w64 compiler for {ARCH}: {info}")
+import toolchain  # noqa: E402  (spikes/toolchain.py)
 
 
 def build_target(opt: int) -> Path:
     BUILD.mkdir(parents=True, exist_ok=True)
     suffix = ".exe" if IS_WINDOWS else ""
     out = BUILD / f"spike1_target_{sys.platform}_{ARCH}_O{opt}{suffix}"
-    src = SPIKES / "spike1_target.c"
-    if IS_WINDOWS:
-        compiler = find_mingw_compiler()
-        cmd = [compiler, f"-O{opt}", "-static", "-o", str(out), str(src)]
-    else:
-        compiler = shutil.which("gcc") or shutil.which("cc")
-        cmd = [compiler, f"-O{opt}", "-no-pie", "-rdynamic",
-               "-o", str(out), str(src)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise SystemExit(f"build failed: {proc.stderr}")
-    print(f"built {out} ({out.stat().st_size} bytes) with {compiler}",
-          flush=True)
+    result = toolchain.compile_c(SPIKES / "spike1_target.c", out, opt)
+    if not result["ok"]:
+        raise SystemExit(f"build failed: {result}")
+    print(f"built {out} ({out.stat().st_size} bytes) with "
+          f"{result['compiler']}", flush=True)
     return out
 
 

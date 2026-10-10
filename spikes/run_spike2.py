@@ -36,43 +36,22 @@ IS_WINDOWS = sys.platform == "win32"
 ARCH = "x64" if sys.maxsize > 2 ** 32 else "x86"
 
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(SPIKES))
+
+import toolchain  # noqa: E402
 
 HEAD_LEN = 8
-
-
-def find_mingw_compiler() -> str:
-    import install_mingw  # noqa: E402
-
-    info = install_mingw.install(ARCH)
-    compiler = info.get("compiler")
-    if compiler and Path(compiler).exists():
-        return compiler
-    exe = ("i686-w64-mingw32-gcc.exe" if ARCH == "x86"
-           else "x86_64-w64-mingw32-gcc.exe")
-    for candidate in sorted((ROOT / "tools" / "mingw" / ARCH)
-                            .glob("*/bin/" + exe)):
-        return str(candidate)
-    found = shutil.which(exe)
-    if found:
-        return found
-    raise SystemExit(f"no mingw-w64 compiler for {ARCH}: {info}")
 
 
 def build_target(opt: int) -> Path:
     BUILD.mkdir(parents=True, exist_ok=True)
     suffix = ".exe" if IS_WINDOWS else ""
     out = BUILD / f"spike2_target_{sys.platform}_{ARCH}_O{opt}{suffix}"
-    src = SPIKES / "spike2_target.c"
-    if IS_WINDOWS:
-        compiler = find_mingw_compiler()
-        cmd = [compiler, f"-O{opt}", "-static", "-o", str(out), str(src)]
-    else:
-        compiler = shutil.which("gcc") or shutil.which("cc")
-        cmd = [compiler, f"-O{opt}", "-no-pie", "-o", str(out), str(src)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise SystemExit(f"build failed: {proc.stderr}")
-    print(f"built {out} ({out.stat().st_size} bytes)", flush=True)
+    result = toolchain.compile_c(SPIKES / "spike2_target.c", out, opt)
+    if not result["ok"]:
+        raise SystemExit(f"build failed: {result}")
+    print(f"built {out} ({out.stat().st_size} bytes) with "
+          f"{result['compiler']}", flush=True)
     return out
 
 
@@ -134,6 +113,7 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
 
     status = None
     deadline = time.time() + duration
+    last_report = 0.0
     while time.time() < deadline:
         time.sleep(2)
         try:
@@ -145,8 +125,9 @@ def run_agent(exe: Path, workdir: Path, head_hex: str, nt_path: str,
             print(f"  stage0 complete: lic_copy={status['licCopy']}",
                   flush=True)
             break
-        if status.get("redirects") and not status.get("licenseMapped"):
-            pass  # still inside the license check
+        if time.time() - last_report >= 15:
+            last_report = time.time()
+            print(f"  ... {status}", flush=True)
     print(f"  status: {json.dumps(status)}", flush=True)
 
     try:
@@ -318,9 +299,19 @@ def ci_pass(args) -> int:
         workdir = exe.parent
         print(f"\n=== {label}: {exe.name} (v{target['version']}) ===",
               flush=True)
-        run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
-                        str(dummy))
-        verdict = judge_ci(run, head_hex)
+        try:
+            run = run_agent(exe, workdir, head_hex, nt_path, args.duration,
+                            str(dummy))
+            verdict = judge_ci(run, head_hex)
+        except Exception as exc:  # noqa: BLE001
+            # One sample refusing to inject must not take the whole leg down
+            # (it did once: ragexe raised ProcessNotRespondingError and no
+            # results were written at all).
+            import traceback
+            print(f"  runner exception: {exc}", flush=True)
+            rows.append({"label": label, "error": str(exc),
+                         "traceback": traceback.format_exc()})
+            continue
         run["label"] = label
         run["verdict"] = verdict
         rows.append(run)
@@ -359,7 +350,7 @@ def main() -> int:
     parser.add_argument("--local", action="store_true")
     parser.add_argument("--ci", action="store_true")
     parser.add_argument("--opts", default="0,2")
-    parser.add_argument("--duration", type=int, default=90)
+    parser.add_argument("--duration", type=int, default=150)
     parser.add_argument("--dummy", default="")
     parser.add_argument("--targets", default="")
     args = parser.parse_args()

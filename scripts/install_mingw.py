@@ -28,6 +28,22 @@ RESULTS = ROOT / "results"
 
 RELEASES_API = ("https://api.github.com/repos/brechtsanders/winlibs_mingw/"
                 "releases?per_page=5")
+
+# Fallback when the release lookup is rate-limited (the shared runner IP gets
+# "HTTP Error 403: rate limit exceeded" often enough to break whole jobs):
+# permalinks to a known-good release asset.
+PINNED = {
+    "x86": ("16.2.0posix-14.0.0-ucrt-r2",
+            "winlibs-i686-posix-dwarf-gcc-16.2.0-mingw-w64ucrt-14.0.0-r2.zip"),
+    "x64": ("16.2.0posix-14.0.0-ucrt-r2",
+            "winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r2.zip"),
+}
+
+
+def pinned_asset(arch: str):
+    tag, name = PINNED[arch]
+    return name, ("https://github.com/brechtsanders/winlibs_mingw/releases/"
+                  f"download/{tag}/{name}")
 UA = {"User-Agent": "unlicense-ci-mingw-fetch"}
 
 
@@ -71,13 +87,12 @@ def install(arch: str) -> dict:
     dest.mkdir(parents=True, exist_ok=True)
     try:
         releases = fetch_json(RELEASES_API)
+        name, url = pick_asset(releases, arch)
+        if not url:
+            raise RuntimeError("no matching winlibs asset found")
     except Exception as exc:  # noqa: BLE001
-        info["status"] = f"release lookup failed: {exc}"
-        return info
-    name, url = pick_asset(releases, arch)
-    if not url:
-        info["status"] = "no matching winlibs asset found"
-        return info
+        name, url = pinned_asset(arch)
+        info["lookup"] = f"release lookup failed ({exc}); using pinned asset"
     info["asset"] = name
     info["url"] = url
     archive = dest / "toolchain.zip"

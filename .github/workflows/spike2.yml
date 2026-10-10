@@ -20,9 +20,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The licence-gated samples are 32-bit; the interpreter width must
-        # match the target (same rule as unlicense's interpreter_can_dump_pe).
-        python_arch: [x86]
+        # The interpreter width must match the target's (same rule as
+        # unlicense's interpreter_can_dump_pe). Which samples are worth
+        # trying depends on the bitness: whatlicense's own sample and the
+        # x86 Themida/WinLicense ones on x86, and the two targets the
+        # upstream probe left as "OEP timeout" (i.e. license-gated) on x64.
+        include:
+          - python_arch: x86
+            targets: "whatlic_sample,vc_example,ragexe"
+          - python_arch: x64
+            targets: "drchost,target51,test84"
     runs-on: windows-2022
     timeout-minutes: 90
     steps:
@@ -52,7 +59,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install .
 
+      # Best effort: MSVC covers everything the spikes build, and the stub
+      # builder falls back to it. mingw is still preferred where decorated
+      # symbol names matter, and install_mingw.py now has a pinned-asset
+      # fallback for the rate-limited release API.
       - name: Fetch mingw-w64 for this architecture
+        continue-on-error: true
         run: python scripts/install_mingw.py
 
       # Everything the job needs must exist by the time the real steps run,
@@ -107,7 +119,7 @@ jobs:
 
       - name: Spike 2 against real samples (Stage 0)
         continue-on-error: true
-        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets vc_example,whatlic_sample,ragexe --duration 90
+        run: python spikes/run_spike2.py --ci --dummy results/spike2_dummy/regkey.dat --targets ${{ matrix.targets }} --duration 150
 
       - name: Upload spike 2 results
         if: always()
