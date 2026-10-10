@@ -253,7 +253,8 @@ function stage2State() {
             active: false, sub: 0, decLic: null, hash3: 0,
             guardStart: null, guardLength: 0, hits: 0, rearms: 0,
             rearmPending: false, cmpAddress: null, realHash3: null,
-            cmpCandidates: 0, neutralised: 0, followed: []
+            cmpCandidates: 0, neutralised: 0, followed: [],
+            insideAtFollow: 0
         };
     }
     return plan.stage2;
@@ -363,6 +364,17 @@ function stage2OnGuardAccess(details) {
 
 function stage2FollowThreads() {
     const s2 = stage2State();
+    /* Drop Stalker's compiled-block cache first. The blocks compiled during
+     * Stage 0 were built by a transform that knew nothing about Stage 2, and
+     * following a thread again reuses cached blocks instead of recompiling
+     * them -- so without this the comparison is never even examined. The tell
+     * was "cmp seen=1" for an entire program: only one freshly compiled block
+     * ever reached the check. */
+    try {
+        Stalker.flush();
+    } catch (e) {
+        /* best effort */
+    }
     for (const thread of Process.enumerateThreads()) {
         try {
             Stalker.follow(thread.id, { transform: install });
@@ -371,7 +383,9 @@ function stage2FollowThreads() {
             /* best effort */
         }
     }
-    stage2Log("following", s2.followed.length + " threads for the comparison");
+    s2.insideAtFollow = stats.inside;
+    stage2Log("following", s2.followed.length + " threads for the comparison" +
+        " (flushed; instructions seen so far " + stats.inside + ")");
     /* Bounded window: if the comparison never shows up, stop tracing rather
      * than leaving the target slowed down for the rest of the run. */
     setTimeout(function () {
@@ -382,7 +396,8 @@ function stage2FollowThreads() {
                 " no-mem-or-reg=" + (s2.scanNoMemReg || 0) +
                 " mem-not-word=" + (s2.scanMemNotWord || 0) +
                 " reg-not-word=" + (s2.scanRegNotWord || 0) +
-                " lastReg=" + (s2.scanLastReg || "-"));
+                " lastReg=" + (s2.scanLastReg || "-") +
+                " instructions traced=" + (stats.inside - s2.insideAtFollow));
         }
     }, 8000);
 }
