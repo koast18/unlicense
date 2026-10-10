@@ -860,6 +860,11 @@ function stage1ReturnCandidates(context) {
 const PAGE_READWRITE = 0x04;
 const PAGE_GUARD = 0x100;
 
+/* Cap on deferred re-arms. A page that is touched continuously would
+ * otherwise re-arm forever; after this many attempts we give up and say so
+ * rather than slowing the target to a crawl. */
+const MAX_REARMS = 20000;
+
 let virtualProtect = null;
 function getVirtualProtect() {
     if (virtualProtect === null) {
@@ -869,6 +874,38 @@ function getVirtualProtect() {
             ["pointer", "size_t", "uint32", "pointer"]);
     }
     return virtualProtect;
+}
+
+/* Re-arm the guard AFTER the faulting instruction has retried and completed.
+ *
+ * Arming from inside the exception handler is fatal: the OS clears the guard
+ * bit when it raises STATUS_GUARD_PAGE_VIOLATION so the faulting instruction
+ * can retry, and putting the guard back before that retry makes the retry
+ * fault on the same instruction again -- the thread then spins inside the
+ * handler forever (observed as the status RPC timing out while the process
+ * stayed alive). Deferring to the JS thread lets the retry finish first.
+ */
+function scheduleRearm() {
+    const stage1 = plan.stage1;
+    if (!stage1.active || stage1.sub !== 1 || stage1.rearmPending) {
+        return;
+    }
+    if (stage1.rearms >= MAX_REARMS) {
+        if (!stage1.rearmCapped) {
+            stage1.rearmCapped = true;
+            stage1Log("rearm-capped", "gave up after " + stage1.rearms +
+                " re-arms; the page is touched continuously");
+        }
+        return;
+    }
+    stage1.rearmPending = true;
+    setTimeout(function () {
+        stage1.rearmPending = false;
+        if (plan.stage1.active && plan.stage1.sub === 1) {
+            plan.stage1.rearms++;
+            armGuard();
+        }
+    }, 0);
 }
 
 function armGuard() {
@@ -930,21 +967,41 @@ function stage1OnLicensePageAccess(details) {
         stage1Log("guard-hit", "#" + stage1.guardHits + " op=" + operation +
             " addr=" + address + " lic_copy=" + stage1.preRsaBuf);
     }
-    /* The first READ anywhere in the guarded page is the landmark.
+    /* The first READ in the guarded page that comes from the main module is
+     * the landmark.
      *
-     * Deliberately do NOT re-arm the guard. The OS cleared the guard bit on
-     * this violation, so the faulting instruction retries and completes. If
-     * we re-armed here the retry would fault again on the very same
-     * instruction and the thread would spin inside this handler forever --
-     * observed as the status RPC timing out while the process stayed alive.
+     * Deliberately do NOT re-arm synchronously. The OS cleared the guard bit
+     * on this violation, so the faulting instruction retries and completes.
+     * Re-arming here would make that retry fault again on the very same
+     * instruction and spin the thread forever -- observed as the status RPC
+     * timing out while the process stayed alive. Collateral reads are
+     * skipped with a deferred re-arm instead (scheduleRearm).
      *
      * Requiring the address to be inside [lic_copy, lic_copy + lic_size) was
-     * also wrong: that is only the file image, while the program's license
+     * wrong: that is only the file image, while the program's license
      * structure spans the whole page (the byte-store candidates land at
-     * 0x608b80, 0x608bb7 and 0x608d30 for a 465-byte license). The first
-     * read in the page is the license consumer we are hunting for.
+     * 0x608b80, 0x608bb7 and 0x608d30 for a 465-byte license).
      */
     if (operation !== "read") {
+        return true;
+    }
+    const pc = details.context[PC_REG];
+    /* Only a read issued from the main module can be the license consumer:
+     * the RSA code (libtomcrypt) is statically linked into it. Reads of the
+     * same page from ntdll/kernelbase are heap bookkeeping, and treating one
+     * of those as the landmark would send sub-stage 2 to a system routine
+     * with no in-module return address (the run before this one showed
+     * exactly that: pc=0x7ffdbb5be70d reading 0x608d60, while drchost's main
+     * module sits at 0x140000000). */
+    const from = Process.findModuleByAddress(pc);
+    if (from === null || from.name !== plan.mainModuleName) {
+        stage1.collateralReads = (stage1.collateralReads || 0) + 1;
+        if (stage1.collateralReads <= 5) {
+            stage1Log("sub1-collateral-read", "pc=" + pc + " (" +
+                (from === null ? "?" : from.name) + ") addr=" + address);
+        }
+        /* Skip it and keep watching: re-arm once the retry has completed. */
+        scheduleRearm();
         return true;
     }
     const context = details.context;
@@ -1054,6 +1111,8 @@ rpc.exports = {
                 preRsaBuf: null, retToRsa: null, decLic: null,
                 keyRef: null, keyRefReads: 0, guardStart: null,
                 guardLength: 0, guardArmed: false, guardHits: 0,
+                collateralReads: 0, rearms: 0, rearmPending: false,
+                rearmCapped: false,
                 retCandidates: [],
                 mpExptmod: null, callCount: 0, decSections: 0,
                 mpInts: null, firstSwapLogged: false, lastCall: null
@@ -1210,6 +1269,8 @@ rpc.exports = {
             stage1Sub: plan.stage1.sub,
             stage1GuardHits: plan.stage1.guardHits,
             stage1GuardArmed: plan.stage1.guardArmed,
+            stage1CollateralReads: plan.stage1.collateralReads,
+            stage1Rearms: plan.stage1.rearms,
             stage1Complete: report.stage1Complete === true,
             stage1MpExptmod: plan.stage1.mpExptmod,
             stage1DecLic: plan.stage1.decLic,
